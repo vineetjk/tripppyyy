@@ -1,0 +1,36 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Invite code lookup — public read/write
+    match /inviteCodes/{code} {
+      allow read: if true;
+      allow create: if true;
+      allow delete: if false; // only deleted via batch when trip is deleted
+    }
+
+    // Trips
+    match /trips/{tripId} {
+      allow read: if true;
+      allow create: if true;
+      allow update: if true;   // members update places array
+      allow delete: if true;   // admin deletes trip
+
+      // Members subcollection
+      match /members/{memberId} {
+        allow read: if true;
+        allow create: if true;  // join trip
+        allow update: if true;  // edit UPI / name
+        allow delete: if true;  // remove member (admin) or leave (self)
+      }
+
+      // Expenses subcollection
+      match /expenses/{expenseId} {
+        allow read: if true;
+        allow create: if true;  // any member adds expense
+        allow delete: if true;  // member deletes own, admin deletes any
+        allow update: if false; // no edits for now — delete and re-add
+      }
+    }
+  }
+}

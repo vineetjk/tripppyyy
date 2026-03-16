@@ -1,296 +1,368 @@
 /* =============================================
-   TRIPPPYYY – Trip Expense Sharing App
+   TRIPPPYYY — Firebase Real-Time Edition
    ============================================= */
 
-// --- Config ---
-const STORAGE_KEY = 'tripppyyy_v1';
+'use strict';
+
+// =============================================
+// SECTION 1: STATE
+// =============================================
+
+const S = {
+  db: null,
+  trip: null,       // current trip doc data { id, name, inviteCode, places, ... }
+  members: [],      // live from Firestore
+  expenses: [],     // live from Firestore, ordered by createdAt asc
+  myMemberId: null, // for current trip
+  activeListeners: [],
+  currentTab: 'expenses',
+  geocodeCache: {},
+};
+
+// =============================================
+// SECTION 2: DEVICE IDENTITY & LOCAL REGISTRY
+// =============================================
+
+function getDeviceId() {
+  let id = localStorage.getItem('tpyyy_device');
+  if (!id) { id = uid(); localStorage.setItem('tpyyy_device', id); }
+  return id;
+}
+
+function getRegistry() {
+  try { return JSON.parse(localStorage.getItem('tpyyy_registry') || '[]'); }
+  catch { return []; }
+}
+
+function saveToRegistry({ tripId, memberId, tripName, inviteCode }) {
+  const reg = getRegistry();
+  const i = reg.findIndex(r => r.tripId === tripId);
+  const entry = { tripId, memberId, tripName, inviteCode };
+  if (i >= 0) reg[i] = entry; else reg.unshift(entry);
+  localStorage.setItem('tpyyy_registry', JSON.stringify(reg));
+}
+
+function removeFromRegistry(tripId) {
+  localStorage.setItem('tpyyy_registry', JSON.stringify(getRegistry().filter(r => r.tripId !== tripId)));
+}
+
+function getMemberId(tripId) {
+  return getRegistry().find(r => r.tripId === tripId)?.memberId || null;
+}
+
+// =============================================
+// SECTION 3: FIREBASE DB OPERATIONS
+// =============================================
+
+function getDb() {
+  if (!S.db) throw new Error('Firebase not initialized');
+  return S.db;
+}
+
+const TS = () => firebase.firestore.FieldValue.serverTimestamp();
+
+async function generateInviteCode() {
+  const db = getDb();
+  for (let i = 0; i < 10; i++) {
+    const code = Math.random().toString(36).slice(2, 8).toUpperCase();
+    const snap = await db.collection('inviteCodes').doc(code).get();
+    if (!snap.exists) return code;
+  }
+  return uid().slice(0, 6).toUpperCase();
+}
+
+async function dbCreateTrip(tripName, places, creatorName, creatorUpiId) {
+  const db = getDb();
+  const deviceId = getDeviceId();
+  const inviteCode = await generateInviteCode();
+
+  const tripRef = db.collection('trips').doc();
+  const tripId = tripRef.id;
+  const memberRef = db.collection('trips').doc(tripId).collection('members').doc();
+
+  const mappedPlaces = places.map((p, i) => ({
+    id: uid(), name: p.name, lat: p.lat || null, lng: p.lng || null,
+    order: i, completed: false,
+  }));
+
+  const batch = db.batch();
+  batch.set(tripRef, { name: tripName, inviteCode, places: mappedPlaces, createdAt: TS(), adminDeviceId: deviceId, currency: 'INR' });
+  batch.set(memberRef, { name: creatorName, upiId: creatorUpiId || '', color: pickColor(0), deviceId, isAdmin: true, joinedAt: TS() });
+  batch.set(db.collection('inviteCodes').doc(inviteCode), { tripId, createdAt: TS() });
+  await batch.commit();
+
+  return { tripId, memberId: memberRef.id, inviteCode };
+}
+
+async function dbJoinTrip(code, name, upiId) {
+  const db = getDb();
+  const deviceId = getDeviceId();
+  const normCode = code.trim().toUpperCase();
+
+  const codeDoc = await db.collection('inviteCodes').doc(normCode).get();
+  if (!codeDoc.exists) throw new Error('Invalid invite code. Check and try again.');
+  const tripId = codeDoc.data().tripId;
+
+  // Already a member on this device?
+  const existing = await db.collection('trips').doc(tripId).collection('members')
+    .where('deviceId', '==', deviceId).get();
+  if (!existing.empty) {
+    const tripDoc = await db.collection('trips').doc(tripId).get();
+    return { tripId, memberId: existing.docs[0].id, tripName: tripDoc.data()?.name || '', inviteCode: normCode };
+  }
+
+  const membersSnap = await db.collection('trips').doc(tripId).collection('members').get();
+  const memberRef = db.collection('trips').doc(tripId).collection('members').doc();
+  await memberRef.set({ name, upiId: upiId || '', color: pickColor(membersSnap.size), deviceId, isAdmin: false, joinedAt: TS() });
+
+  const tripDoc = await db.collection('trips').doc(tripId).get();
+  return { tripId, memberId: memberRef.id, tripName: tripDoc.data()?.name || '', inviteCode: normCode };
+}
+
+async function dbAddExpense(tripId, data) {
+  const db = getDb();
+  const ref = db.collection('trips').doc(tripId).collection('expenses').doc();
+  await ref.set({
+    description: data.description, amount: data.amount, paidBy: data.paidBy,
+    splits: data.splits, category: data.category || 'general',
+    date: data.date || today(), createdBy: S.myMemberId,
+    createdAt: TS(), note: data.note || '',
+  });
+  return ref.id;
+}
+
+async function dbRemoveExpense(tripId, expenseId) {
+  await getDb().collection('trips').doc(tripId).collection('expenses').doc(expenseId).delete();
+}
+
+async function dbUpdateMember(tripId, memberId, data) {
+  await getDb().collection('trips').doc(tripId).collection('members').doc(memberId).update(data);
+}
+
+async function dbRemoveMember(tripId, memberId) {
+  await getDb().collection('trips').doc(tripId).collection('members').doc(memberId).delete();
+}
+
+async function dbTogglePlace(tripId, placeId) {
+  const db = getDb();
+  const ref = db.collection('trips').doc(tripId);
+  const snap = await ref.get();
+  const places = (snap.data()?.places || []).map(p =>
+    p.id === placeId ? { ...p, completed: !p.completed } : p
+  );
+  await ref.update({ places });
+}
+
+async function dbAddPlace(tripId, place) {
+  const db = getDb();
+  const ref = db.collection('trips').doc(tripId);
+  const snap = await ref.get();
+  const places = snap.data()?.places || [];
+  places.push({ id: uid(), name: place.name, lat: place.lat || null, lng: place.lng || null, order: places.length, completed: false });
+  await ref.update({ places });
+}
+
+async function dbRemovePlace(tripId, placeId) {
+  const db = getDb();
+  const ref = db.collection('trips').doc(tripId);
+  const snap = await ref.get();
+  const places = (snap.data()?.places || []).filter(p => p.id !== placeId).map((p, i) => ({ ...p, order: i }));
+  await ref.update({ places });
+}
+
+async function dbLeaveOrDeleteTrip(tripId) {
+  const db = getDb();
+  const isAdmin = S.trip?.adminDeviceId === getDeviceId();
+  if (isAdmin) {
+    // Delete entire trip (admin only)
+    const batch = db.batch();
+    const [members, expenses] = await Promise.all([
+      db.collection('trips').doc(tripId).collection('members').get(),
+      db.collection('trips').doc(tripId).collection('expenses').get(),
+    ]);
+    members.forEach(d => batch.delete(d.ref));
+    expenses.forEach(d => batch.delete(d.ref));
+    batch.delete(db.collection('trips').doc(tripId));
+    const inviteCode = S.trip?.inviteCode;
+    if (inviteCode) batch.delete(db.collection('inviteCodes').doc(inviteCode));
+    await batch.commit();
+  } else {
+    // Just remove self as member
+    if (S.myMemberId) await dbRemoveMember(tripId, S.myMemberId);
+  }
+  removeFromRegistry(tripId);
+}
+
+// =============================================
+// SECTION 4: REAL-TIME LISTENERS
+// =============================================
+
+function detachListeners() {
+  S.activeListeners.forEach(fn => { try { fn(); } catch (_) {} });
+  S.activeListeners = [];
+}
+
+function attachListeners(tripId) {
+  detachListeners();
+  const db = getDb();
+
+  // Trip document (name, places, inviteCode)
+  const u1 = db.collection('trips').doc(tripId).onSnapshot(snap => {
+    if (!snap.exists) return;
+    S.trip = { id: snap.id, ...snap.data() };
+    updateTripHeader();
+    if (S.currentTab === 'map' || S.currentTab === 'itinerary') rerenderTab();
+  });
+
+  // Members subcollection
+  const u2 = db.collection('trips').doc(tripId).collection('members').onSnapshot(snap => {
+    S.members = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+    if (S.currentTab === 'members' || S.currentTab === 'settle') rerenderTab();
+    // Update tab meta text
+    updateTripHeader();
+  });
+
+  // Expenses subcollection ordered by createdAt
+  const u3 = db.collection('trips').doc(tripId).collection('expenses')
+    .orderBy('createdAt', 'asc')
+    .onSnapshot(snap => {
+      const prev = S.expenses;
+      S.expenses = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+      if (S.currentTab === 'expenses') {
+        if (S.expenses.length > prev.length && isOnlyAppended(prev, S.expenses)) {
+          appendNewBubbles(S.expenses.slice(prev.length));
+        } else {
+          rerenderTab();
+        }
+      }
+      if (S.currentTab === 'settle') rerenderTab();
+    });
+
+  S.activeListeners = [u1, u2, u3];
+}
+
+function isOnlyAppended(prev, next) {
+  for (let i = 0; i < prev.length; i++) if (prev[i].id !== next[i]?.id) return false;
+  return true;
+}
+
+function updateTripHeader() {
+  const h1 = document.querySelector('.trip-title h1');
+  const meta = document.querySelector('.trip-meta');
+  if (h1 && S.trip) h1.textContent = S.trip.name;
+  if (meta && S.trip) meta.textContent = `${(S.trip.places || []).length} places · ${S.members.length} members`;
+}
+
+function rerenderTab() {
+  const body = document.getElementById('tab-body');
+  if (!body || !S.trip) return;
+  const tab = S.currentTab;
+  if (tab === 'map') renderMapTab(body);
+  else if (tab === 'itinerary') renderItineraryTab(body);
+  else if (tab === 'expenses') renderExpensesTab(body);
+  else if (tab === 'members') renderMembersTab(body);
+  else if (tab === 'settle') renderSettleTab(body);
+}
+
+// =============================================
+// SECTION 5: GEOCODING & MAPS URL PARSING
+// =============================================
+
 const NOMINATIM = 'https://nominatim.openstreetmap.org/search';
 const ALLORIGINS = 'https://api.allorigins.win/get?url=';
 
-// --- State ---
-let state = {
-  trips: [],
-  currentTripId: null,
-  geocodeCache: {},
-};
-let mapInstance = null;
-let mapMarkers = [];
-let routeLayer = null;
-let currentSplitType = 'equal';
-
-// =============================================
-// DATA PERSISTENCE
-// =============================================
-
-function loadData() {
-  try {
-    const raw = localStorage.getItem(STORAGE_KEY);
-    if (raw) {
-      const d = JSON.parse(raw);
-      state.trips = d.trips || [];
-      state.geocodeCache = d.geocodeCache || {};
-    }
-  } catch (e) { console.error('Load error', e); }
-}
-
-function saveData() {
-  try {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify({
-      trips: state.trips,
-      geocodeCache: state.geocodeCache,
-    }));
-  } catch (e) { console.error('Save error', e); }
-}
-
-function uid() {
-  return Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
-}
-
-// =============================================
-// GOOGLE MAPS URL PARSING
-// =============================================
-
-async function parseGoogleMapsUrl(rawUrl) {
-  const url = rawUrl.trim();
-  let expandedUrl = url;
-  let places = [];
-
-  // Step 1: Try to expand short URLs via CORS proxy
-  const isShort = /maps\.app\.goo\.gl|goo\.gl\/maps/.test(url);
-  if (isShort) {
-    try {
-      const proxyUrl = ALLORIGINS + encodeURIComponent(url);
-      const res = await fetch(proxyUrl, { signal: AbortSignal.timeout(12000) });
-      const data = await res.json();
-      const html = data.contents || '';
-
-      // Extract the canonical / redirect URL from the HTML
-      const patterns = [
-        /rel="canonical"\s+href="([^"]+)"/,
-        /<link[^>]+href="(https:\/\/(?:www\.google\.com\/maps|maps\.google\.com)[^"]+)"/,
-        /window\.location(?:\.href)?\s*=\s*["']([^"']+)["']/,
-        /INITIAL_DATA.*?"(https:\\\/\\\/www\.google\.com\\\/maps[^"]+)"/,
-      ];
-      for (const p of patterns) {
-        const m = html.match(p);
-        if (m) { expandedUrl = m[1].replace(/\\\//g, '/'); break; }
-      }
-
-      // Fallback: grab title
-      if (expandedUrl === url) {
-        const titleM = html.match(/<title[^>]*>([^<]+)<\/title>/);
-        if (titleM) {
-          const t = titleM[1].replace(/ [-–] Google Maps$/, '').trim();
-          if (t && t !== 'Google Maps') places.push(t);
-        }
-      }
-    } catch (e) {
-      console.warn('URL expand failed:', e.message);
-    }
-  }
-
-  if (places.length === 0) {
-    places = extractPlacesFromUrl(expandedUrl);
-  }
-
-  return places;
-}
-
-function extractPlacesFromUrl(url) {
-  const places = [];
-  try {
-    const u = new URL(url);
-    const path = u.pathname;
-
-    // /maps/dir/A/B/C pattern
-    const dirM = path.match(/\/maps\/dir\/(.+)/);
-    if (dirM) {
-      const segs = dirM[1].split('/');
-      for (const seg of segs) {
-        if (!seg || seg.startsWith('@')) continue;
-        const dec = decodeURIComponent(seg.replace(/\+/g, ' ')).trim();
-        if (dec.length > 1 && !/^[\d.,]+$/.test(dec)) places.push(dec);
-      }
-    }
-
-    // /maps/place/Name pattern
-    if (!places.length) {
-      const plM = path.match(/\/maps\/place\/([^/@]+)/);
-      if (plM) places.push(decodeURIComponent(plM[1].replace(/\+/g, ' ')));
-    }
-
-    // Query params fallback
-    if (!places.length) {
-      const q = u.searchParams.get('q') || u.searchParams.get('query');
-      if (q) places.push(decodeURIComponent(q));
-    }
-
-    // saddr/daddr (old format)
-    const saddr = u.searchParams.get('saddr');
-    const daddr = u.searchParams.get('daddr');
-    if (saddr) places.unshift(saddr.replace(/\+/g, ' '));
-    if (daddr) {
-      const viaParts = daddr.split(/\+via:|\bvia:/i);
-      viaParts.forEach(p => { const c = p.replace(/\+/g, ' ').trim(); if (c) places.push(c); });
-    }
-  } catch (_) {}
-  return places.filter(Boolean);
-}
-
-// =============================================
-// GEOCODING
-// =============================================
-
 async function geocodePlace(name) {
   const key = name.toLowerCase().trim();
-  if (state.geocodeCache[key]) return state.geocodeCache[key];
-
+  if (S.geocodeCache[key]) return S.geocodeCache[key];
   try {
-    const p = new URLSearchParams({ q: name, format: 'json', limit: '1', addressdetails: '0' });
+    const p = new URLSearchParams({ q: name, format: 'json', limit: '1' });
     const res = await fetch(`${NOMINATIM}?${p}`, {
-      headers: { 'Accept-Language': 'en', 'User-Agent': 'Tripppyyy/1.0' },
+      headers: { 'Accept-Language': 'en', 'User-Agent': 'Tripppyyy/2.0' },
       signal: AbortSignal.timeout(8000),
     });
-    if (!res.ok) throw new Error('HTTP ' + res.status);
     const json = await res.json();
-    if (json.length > 0) {
-      const r = { lat: parseFloat(json[0].lat), lng: parseFloat(json[0].lon), displayName: json[0].display_name };
-      state.geocodeCache[key] = r;
-      saveData();
+    if (json.length) {
+      const r = { lat: parseFloat(json[0].lat), lng: parseFloat(json[0].lon) };
+      S.geocodeCache[key] = r;
+      localStorage.setItem('tpyyy_geo', JSON.stringify(S.geocodeCache));
       return r;
     }
-  } catch (e) {
-    console.warn('Geocode error for', name, e.message);
-  }
+  } catch (e) { console.warn('Geocode:', e.message); }
   return null;
 }
 
 async function geocodePlaces(names, onProgress) {
   const results = [];
   for (let i = 0; i < names.length; i++) {
-    if (i > 0) await sleep(1100); // Nominatim rate limit: 1 req/sec
-    onProgress && onProgress(i, names.length, names[i]);
+    if (i > 0) await sleep(1100);
+    onProgress?.(i, names.length, names[i]);
     const r = await geocodePlace(names[i]);
     results.push({ name: names[i], ...(r || {}), found: !!r });
   }
   return results;
 }
 
-function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+async function parseGoogleMapsUrl(rawUrl) {
+  const url = rawUrl.trim();
+  let expandedUrl = url;
+
+  if (/maps\.app\.goo\.gl|goo\.gl\/maps/.test(url)) {
+    try {
+      const res = await fetch(ALLORIGINS + encodeURIComponent(url), { signal: AbortSignal.timeout(12000) });
+      const data = await res.json();
+      const html = data.contents || '';
+      const pats = [
+        /rel="canonical"\s+href="([^"]+)"/,
+        /<link[^>]+href="(https:\/\/(?:www\.google\.com\/maps|maps\.google\.com)[^"]+)"/,
+      ];
+      for (const p of pats) { const m = html.match(p); if (m) { expandedUrl = m[1]; break; } }
+    } catch (e) { console.warn('URL expand:', e.message); }
+  }
+
+  return extractPlacesFromUrl(expandedUrl);
+}
+
+function extractPlacesFromUrl(url) {
+  const places = [];
+  try {
+    const u = new URL(url);
+    const dirM = u.pathname.match(/\/maps\/dir\/(.+)/);
+    if (dirM) {
+      dirM[1].split('/').forEach(seg => {
+        if (!seg || seg.startsWith('@')) return;
+        const dec = decodeURIComponent(seg.replace(/\+/g, ' ')).trim();
+        if (dec.length > 1 && !/^[\d.,]+$/.test(dec)) places.push(dec);
+      });
+    }
+    if (!places.length) {
+      const plM = u.pathname.match(/\/maps\/place\/([^/@]+)/);
+      if (plM) places.push(decodeURIComponent(plM[1].replace(/\+/g, ' ')));
+    }
+    if (!places.length) {
+      const q = u.searchParams.get('q') || u.searchParams.get('query');
+      if (q) places.push(decodeURIComponent(q));
+    }
+  } catch (_) {}
+  return places.filter(Boolean);
+}
 
 // =============================================
-// TRIP / DATA OPERATIONS
+// SECTION 6: FINANCIAL CALCULATIONS
 // =============================================
 
-function createTrip(name, places) {
-  const trip = {
-    id: uid(), name,
-    places: places.map((p, i) => ({
-      id: uid(), name: p.name, lat: p.lat || null, lng: p.lng || null,
-      order: i, completed: false,
-    })),
-    members: [], expenses: [],
-    createdAt: new Date().toISOString(),
-  };
-  state.trips.unshift(trip);
-  saveData();
-  return trip;
-}
-
-function deleteTrip(id) {
-  state.trips = state.trips.filter(t => t.id !== id);
-  saveData();
-}
-
-function getCurrentTrip() {
-  return state.trips.find(t => t.id === state.currentTripId) || null;
-}
-
-function addMember(tripId, { name, upiId }) {
-  const trip = state.trips.find(t => t.id === tripId);
-  if (!trip) return null;
-  const member = { id: uid(), name, upiId: upiId || '', color: pickColor(trip.members.length) };
-  trip.members.push(member);
-  saveData();
-  return member;
-}
-
-function removeMember(tripId, memberId) {
-  const trip = state.trips.find(t => t.id === tripId);
-  if (!trip) return;
-  trip.members = trip.members.filter(m => m.id !== memberId);
-  trip.expenses.forEach(e => {
-    e.splits = e.splits.filter(s => s.memberId !== memberId);
-    if (e.paidBy === memberId) e.paidBy = null;
-  });
-  saveData();
-}
-
-function addExpense(tripId, data) {
-  const trip = state.trips.find(t => t.id === tripId);
-  if (!trip) return null;
-  const expense = {
-    id: uid(),
-    description: data.description,
-    amount: parseFloat(data.amount),
-    paidBy: data.paidBy,
-    splits: data.splits,
-    date: data.date || today(),
-    category: data.category || 'general',
-    createdAt: new Date().toISOString(),
-  };
-  trip.expenses.push(expense);
-  saveData();
-  return expense;
-}
-
-function removeExpense(tripId, expenseId) {
-  const trip = state.trips.find(t => t.id === tripId);
-  if (!trip) return;
-  trip.expenses = trip.expenses.filter(e => e.id !== expenseId);
-  saveData();
-}
-
-function togglePlace(tripId, placeId) {
-  const trip = state.trips.find(t => t.id === tripId);
-  const place = trip?.places.find(p => p.id === placeId);
-  if (place) { place.completed = !place.completed; saveData(); }
-}
-
-function addPlace(tripId, place) {
-  const trip = state.trips.find(t => t.id === tripId);
-  if (!trip) return;
-  trip.places.push({ id: uid(), name: place.name, lat: place.lat || null, lng: place.lng || null, order: trip.places.length, completed: false });
-  saveData();
-}
-
-function removePlace(tripId, placeId) {
-  const trip = state.trips.find(t => t.id === tripId);
-  if (!trip) return;
-  trip.places = trip.places.filter(p => p.id !== placeId);
-  trip.places.forEach((p, i) => p.order = i);
-  saveData();
-}
-
-function today() { return new Date().toISOString().split('T')[0]; }
-
-// =============================================
-// FINANCIAL CALCULATIONS
-// =============================================
-
-function calcBalances(trip) {
+function calcBalances() {
   const bal = {};
-  trip.members.forEach(m => { bal[m.id] = 0; });
-  trip.expenses.forEach(e => {
+  S.members.forEach(m => { bal[m.id] = 0; });
+  S.expenses.forEach(e => {
     if (!e.paidBy || bal[e.paidBy] === undefined) return;
     bal[e.paidBy] += e.amount;
-    e.splits.forEach(s => { if (bal[s.memberId] !== undefined) bal[s.memberId] -= s.amount; });
+    e.splits?.forEach(s => { if (bal[s.memberId] !== undefined) bal[s.memberId] -= s.amount; });
   });
   return bal;
 }
 
-function simplifyDebts(trip) {
-  const bal = calcBalances(trip);
+function simplifyDebts() {
+  const bal = calcBalances();
   const creditors = [], debtors = [];
   Object.entries(bal).forEach(([id, b]) => {
     if (b > 0.01) creditors.push({ id, amount: b });
@@ -298,7 +370,6 @@ function simplifyDebts(trip) {
   });
   creditors.sort((a, b) => b.amount - a.amount);
   debtors.sort((a, b) => b.amount - a.amount);
-
   const debts = [];
   let i = 0, j = 0;
   while (i < creditors.length && j < debtors.length) {
@@ -312,68 +383,43 @@ function simplifyDebts(trip) {
   return debts;
 }
 
-function getTotalExpenses(trip) { return trip.expenses.reduce((s, e) => s + e.amount, 0); }
-function getMemberPaid(trip, id) { return trip.expenses.filter(e => e.paidBy === id).reduce((s, e) => s + e.amount, 0); }
-function getMemberShare(trip, id) { return trip.expenses.reduce((s, e) => { const sp = e.splits.find(s => s.memberId === id); return s + (sp ? sp.amount : 0); }, 0); }
-function round2(n) { return Math.round(n * 100) / 100; }
+function getTotalExpenses() { return S.expenses.reduce((s, e) => s + e.amount, 0); }
+function getMemberPaid(id) { return S.expenses.filter(e => e.paidBy === id).reduce((s, e) => s + e.amount, 0); }
+function getMemberShare(id) { return S.expenses.reduce((s, e) => { const sp = e.splits?.find(s => s.memberId === id); return s + (sp ? sp.amount : 0); }, 0); }
 
 // =============================================
-// UPI PAYMENT
+// SECTION 7: UPI PAYMENTS
 // =============================================
-
-function upiLink(upiId, name, amount, note) {
-  const p = new URLSearchParams({ pa: upiId, pn: name, am: amount.toFixed(2), cu: 'INR', tn: note || 'Trip Settlement' });
-  return `upi://pay?${p.toString()}`;
-}
 
 function buildPayButtons(toMember, amount, tripName) {
-  if (!toMember.upiId) {
-    return `<span class="no-upi">No UPI ID · <button class="btn-link" onclick="switchTab('members')">Add UPI ID</button></span>`;
+  if (!toMember?.upiId) {
+    return `<span class="no-upi">No UPI ID · <button class="btn-link" onclick="showEditMemberModal('${toMember?.id}')">Add UPI ID</button></span>`;
   }
-  const note = encodeURIComponent(`${tripName} settlement`);
-  const upiHref = upiLink(toMember.upiId, toMember.name, amount, `${tripName} settlement`);
-  const gpayHref = `gpay://upi/pay?pa=${encodeURIComponent(toMember.upiId)}&pn=${encodeURIComponent(toMember.name)}&am=${amount.toFixed(2)}&cu=INR&tn=${note}`;
-  const phonepeHref = `phonepe://pay?pa=${encodeURIComponent(toMember.upiId)}&pn=${encodeURIComponent(toMember.name)}&am=${amount.toFixed(2)}&cu=INR&tn=${note}`;
-  const paytmHref = `paytmmp://pay?pa=${encodeURIComponent(toMember.upiId)}&pn=${encodeURIComponent(toMember.name)}&am=${amount.toFixed(2)}&cu=INR&tn=${note}`;
-
+  const note = `${tripName} settlement`;
+  const enc = encodeURIComponent;
+  const base = `pa=${enc(toMember.upiId)}&pn=${enc(toMember.name)}&am=${amount.toFixed(2)}&cu=INR&tn=${enc(note)}`;
   return `
     <div class="upi-options">
-      <a href="${upiHref}" class="btn-pay" onclick="toast('Opening UPI app...','success')">💳 Pay ₹${fmt(amount)}</a>
-      <a href="${gpayHref}" class="upi-option" onclick="toast('Opening GPay...','success')">
-        <img src="https://upload.wikimedia.org/wikipedia/commons/thumb/f/f2/Google_Pay_Logo.svg/512px-Google_Pay_Logo.svg.png" width="16" height="16" alt="GPay"> GPay
+      <a href="upi://pay?${base}" class="btn-pay" onclick="toast('Opening UPI app…','success')">
+        💳 Pay ₹${fmt(amount)}
       </a>
-      <a href="${phonepeHref}" class="upi-option" onclick="toast('Opening PhonePe...','success')">📱 PhonePe</a>
-      <a href="${paytmHref}" class="upi-option" onclick="toast('Opening Paytm...','success')">💰 Paytm</a>
-    </div>
-  `;
+      <a href="gpay://upi/pay?${base}" class="upi-option">
+        <img src="https://upload.wikimedia.org/wikipedia/commons/thumb/f/f2/Google_Pay_Logo.svg/512px-Google_Pay_Logo.svg.png" width="14" height="14" alt=""> GPay
+      </a>
+      <a href="phonepe://pay?${base}" class="upi-option">📱 PhonePe</a>
+      <a href="paytmmp://pay?${base}" class="upi-option">💰 Paytm</a>
+    </div>`;
 }
 
 // =============================================
-// UTILITIES
+// SECTION 8: MAP
 // =============================================
 
-const COLORS = ['#6366f1','#f59e0b','#10b981','#ef4444','#8b5cf6','#f97316','#06b6d4','#ec4899','#84cc16','#14b8a6'];
-function pickColor(i) { return COLORS[i % COLORS.length]; }
-function initials(name) { return (name || '?').split(' ').map(w => w[0]).join('').toUpperCase().slice(0, 2); }
-function fmt(n) {
-  if (isNaN(n) || n == null) return '0.00';
-  return new Intl.NumberFormat('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 }).format(n);
-}
-function escHtml(s) {
-  return String(s || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
-}
-
-const CAT_ICONS = { food:'🍽️', transport:'🚗', hotel:'🏨', activity:'🎯', fuel:'⛽', shopping:'🛍️', medical:'💊', general:'💰' };
-
-// =============================================
-// MAP
-// =============================================
+let mapInstance = null;
 
 function initMap(containerId) {
-  if (mapInstance) { try { mapInstance.remove(); } catch(_){} mapInstance = null; }
-  mapMarkers = []; routeLayer = null;
-
-  mapInstance = L.map(containerId, { zoomControl: true });
+  if (mapInstance) { try { mapInstance.remove(); } catch (_) {} mapInstance = null; }
+  mapInstance = L.map(containerId);
   L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
     attribution: '© <a href="https://openstreetmap.org/copyright">OpenStreetMap</a>',
     maxZoom: 19,
@@ -381,70 +427,118 @@ function initMap(containerId) {
   return mapInstance;
 }
 
-function renderMap(trip) {
+function renderMap(places) {
   if (!mapInstance) return;
-  mapMarkers.forEach(m => { try { mapInstance.removeLayer(m); } catch(_){} });
-  mapMarkers = [];
-  if (routeLayer) { try { mapInstance.removeLayer(routeLayer); } catch(_){} routeLayer = null; }
+  const valid = (places || []).filter(p => p.lat && p.lng);
+  if (!valid.length) { mapInstance.setView([20.5937, 78.9629], 5); return; }
 
-  const places = trip.places.filter(p => p.lat && p.lng);
-  if (!places.length) {
-    mapInstance.setView([20.5937, 78.9629], 5); // India center
-    return;
-  }
-
-  places.forEach((p, i) => {
-    const icon = makeMarkerIcon(i + 1, p.completed);
-    const m = L.marker([p.lat, p.lng], { icon })
+  valid.forEach((p, i) => {
+    L.marker([p.lat, p.lng], { icon: makeMarkerIcon(i + 1, p.completed) })
       .bindPopup(`<div class="map-popup"><strong>${escHtml(p.name)}</strong>${p.completed ? '<br><span class="popup-done">✓ Visited</span>' : ''}</div>`)
       .addTo(mapInstance);
-    mapMarkers.push(m);
   });
 
-  if (places.length > 1) {
-    const coords = places.map(p => [p.lat, p.lng]);
+  if (valid.length > 1) {
+    const coords = valid.map(p => [p.lat, p.lng]);
     L.polyline(coords, { color: '#6366f1', weight: 4, opacity: 0.65 }).addTo(mapInstance);
-    routeLayer = L.polyline(coords, { color: '#a5b4fc', weight: 2, opacity: 0.6, dashArray: '8 6' }).addTo(mapInstance);
+    L.polyline(coords, { color: '#a5b4fc', weight: 2, opacity: 0.6, dashArray: '8 6' }).addTo(mapInstance);
   }
 
-  const bounds = L.latLngBounds(places.map(p => [p.lat, p.lng]));
-  mapInstance.fitBounds(bounds, { padding: [48, 48] });
+  mapInstance.fitBounds(L.latLngBounds(valid.map(p => [p.lat, p.lng])), { padding: [48, 48] });
 }
 
 function makeMarkerIcon(num, completed) {
   const bg = completed ? '#10b981' : '#6366f1';
   const label = completed ? '✓' : num;
-  const fs = completed ? '15px' : '12px';
   return L.divIcon({
     className: 'custom-marker',
-    html: `<div style="background:${bg};color:white;width:34px;height:34px;border-radius:50% 50% 50% 0;transform:rotate(-45deg);border:3px solid white;box-shadow:0 4px 10px rgba(0,0,0,0.25);display:flex;align-items:center;justify-content:center"><span style="transform:rotate(45deg);font-weight:800;font-size:${fs}">${label}</span></div>`,
+    html: `<div style="background:${bg};color:white;width:34px;height:34px;border-radius:50% 50% 50% 0;transform:rotate(-45deg);border:3px solid white;box-shadow:0 4px 10px rgba(0,0,0,0.25);display:flex;align-items:center;justify-content:center"><span style="transform:rotate(45deg);font-weight:800;font-size:${completed ? '14px' : '12px'}">${label}</span></div>`,
     iconSize: [34, 34], iconAnchor: [17, 34], popupAnchor: [0, -36],
   });
 }
 
 // =============================================
-// TOAST
+// SECTION 9: UTILITIES
 // =============================================
 
 function toast(msg, type = 'info') {
-  const prev = document.getElementById('toast');
-  if (prev) prev.remove();
+  document.getElementById('toast')?.remove();
   const el = document.createElement('div');
-  el.id = 'toast';
-  el.className = `toast toast-${type}`;
-  el.textContent = msg;
+  el.id = 'toast'; el.className = `toast toast-${type}`; el.textContent = msg;
   document.body.appendChild(el);
   requestAnimationFrame(() => {
     el.classList.add('show');
-    setTimeout(() => { el.classList.remove('show'); setTimeout(() => el.remove(), 350); }, 3000);
+    setTimeout(() => { el.classList.remove('show'); setTimeout(() => el.remove(), 350); }, 3200);
   });
 }
 
+function uid() { return Date.now().toString(36) + Math.random().toString(36).slice(2, 7); }
+function today() { return new Date().toISOString().split('T')[0]; }
+function round2(n) { return Math.round(n * 100) / 100; }
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+function fmt(n) {
+  if (isNaN(n) || n == null) return '0.00';
+  return new Intl.NumberFormat('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 }).format(n);
+}
+function escHtml(s) {
+  return String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+function initials(name) { return (name || '?').split(' ').map(w => w[0]).join('').toUpperCase().slice(0, 2); }
+const COLORS = ['#6366f1', '#f59e0b', '#10b981', '#ef4444', '#8b5cf6', '#f97316', '#06b6d4', '#ec4899', '#84cc16', '#14b8a6'];
+function pickColor(i) { return COLORS[i % COLORS.length]; }
+const CAT_ICONS = { food: '🍽️', transport: '🚗', hotel: '🏨', activity: '🎯', fuel: '⛽', shopping: '🛍️', medical: '💊', general: '💰' };
+
+function formatTime(ts) {
+  if (!ts) return 'just now';
+  const d = ts.toDate ? ts.toDate() : new Date(ts);
+  const now = new Date();
+  const diff = (now - d) / 1000;
+  if (diff < 60) return 'just now';
+  if (diff < 3600) return `${Math.floor(diff / 60)}m ago`;
+  if (diff < 86400) return d.toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit' });
+  return d.toLocaleDateString('en-IN', { month: 'short', day: 'numeric' });
+}
+
 // =============================================
-// RENDER: HOME VIEW
+// SECTION 10: SETUP SCREEN (no firebase-config.js)
+// =============================================
+
+function renderSetup() {
+  document.getElementById('app').innerHTML = `
+    <div class="setup-screen">
+      <div class="setup-card">
+        <span class="setup-icon">🔥</span>
+        <h1>Firebase Setup Required</h1>
+        <p>Tripppyyy needs Firebase for real-time data sharing. Follow these steps:</p>
+        <ol class="setup-steps">
+          <li>Go to <a href="https://console.firebase.google.com" target="_blank">console.firebase.google.com</a></li>
+          <li>Create a new project (or use an existing one)</li>
+          <li>Click <strong>Add app → Web (⟨/⟩)</strong></li>
+          <li>Copy your Firebase config object</li>
+          <li>Create a file named <code>firebase-config.js</code> in this project folder</li>
+          <li>Paste this content into it:</li>
+        </ol>
+        <pre class="setup-code">const FIREBASE_CONFIG = {
+  apiKey: "your-api-key",
+  authDomain: "your-project.firebaseapp.com",
+  projectId: "your-project-id",
+  storageBucket: "your-project.appspot.com",
+  messagingSenderId: "123456789",
+  appId: "1:123:web:abc"
+};</pre>
+        <p>Then in Firebase Console → Firestore Database → Create database → Start in <strong>test mode</strong></p>
+        <p>Finally, reload this page.</p>
+        <button class="btn-primary large" onclick="location.reload()">↺ Reload after setup</button>
+      </div>
+    </div>`;
+}
+
+// =============================================
+// SECTION 11: HOME VIEW
 // =============================================
 
 function renderHome() {
+  const reg = getRegistry();
   document.getElementById('app').innerHTML = `
     <div class="home-view">
       <header class="app-header">
@@ -457,16 +551,22 @@ function renderHome() {
       <main class="home-main">
         <div class="section-header">
           <h2>Your Trips</h2>
-          <button class="btn-primary" onclick="showNewTripModal()">+ New Trip</button>
+          <div class="btn-group">
+            <button class="btn-secondary" onclick="showJoinModal()">🔗 Join Trip</button>
+            <button class="btn-primary" onclick="showNewTripModal()">+ New Trip</button>
+          </div>
         </div>
-        ${state.trips.length === 0 ? `
+        ${reg.length === 0 ? `
           <div class="empty-state">
             <span class="empty-icon">🗺️</span>
             <h3>No trips yet</h3>
-            <p>Create your first trip by pasting a Google Maps link or entering destinations manually</p>
-            <button class="btn-primary large" onclick="showNewTripModal()">Create Trip</button>
+            <p>Create a new trip or join one with an invite code</p>
+            <div style="display:flex;gap:12px;justify-content:center;flex-wrap:wrap">
+              <button class="btn-secondary large" onclick="showJoinModal()">🔗 Join with Code</button>
+              <button class="btn-primary large" onclick="showNewTripModal()">+ Create Trip</button>
+            </div>
           </div>
-        ` : `<div class="trips-grid">${state.trips.map(tripCard).join('')}</div>`}
+        ` : `<div class="trips-grid">${reg.map(tripCard).join('')}</div>`}
       </main>
     </div>
 
@@ -481,20 +581,29 @@ function renderHome() {
         <div class="modal-body">
           <div class="form-group">
             <label>Trip Name *</label>
-            <input type="text" id="trip-name" placeholder="e.g., Goa Weekend, Ladakh Road Trip" class="form-input">
+            <input type="text" id="trip-name" placeholder="e.g., Goa Weekend 2025" class="form-input">
+          </div>
+          <div class="form-row">
+            <div class="form-group flex-1">
+              <label>Your Name *</label>
+              <input type="text" id="creator-name" placeholder="How others see you" class="form-input" value="${escHtml(localStorage.getItem('tpyyy_myname') || '')}">
+            </div>
+            <div class="form-group flex-1">
+              <label>Your UPI ID</label>
+              <input type="text" id="creator-upi" placeholder="you@paytm" class="form-input" value="${escHtml(localStorage.getItem('tpyyy_myupi') || '')}">
+            </div>
           </div>
           <div class="form-group">
             <label>Google Maps Link (optional)</label>
             <div class="input-with-btn">
-              <input type="text" id="maps-url" placeholder="Paste Google Maps URL..." class="form-input">
-              <button class="btn-secondary" onclick="fetchFromUrl()" id="fetch-btn">Fetch Places</button>
+              <input type="text" id="maps-url" placeholder="Paste Google Maps URL to auto-import stops..." class="form-input">
+              <button class="btn-secondary" onclick="fetchFromUrl()" id="fetch-btn">Import</button>
             </div>
-            <p class="input-hint">Paste any Google Maps directions or place URL to auto-extract destinations</p>
           </div>
           <div class="form-group">
             <label>Destinations</label>
             <div id="places-input-list"></div>
-            <button class="btn-ghost small" onclick="addPlaceInput()" style="margin-top:6px">+ Add Destination</button>
+            <button class="btn-ghost small" onclick="addPlaceInput()" style="margin-top:6px">+ Add Stop</button>
           </div>
         </div>
         <div class="modal-footer">
@@ -503,82 +612,74 @@ function renderHome() {
         </div>
       </div>
     </div>
+    <div id="modals"></div>
   `;
   addPlaceInput();
+  // Load cached geocode
+  try { S.geocodeCache = JSON.parse(localStorage.getItem('tpyyy_geo') || '{}'); } catch (_) {}
 }
 
-function tripCard(trip) {
-  const total = getTotalExpenses(trip);
-  const done = trip.places.filter(p => p.completed).length;
-  const pct = trip.places.length ? (done / trip.places.length * 100) : 0;
+function tripCard(entry) {
   return `
-    <div class="trip-card" onclick="openTrip('${trip.id}')">
+    <div class="trip-card" onclick="openTrip('${entry.tripId}')">
       <div class="trip-card-header">
-        <h3>${escHtml(trip.name)}</h3>
-        <span class="trip-date">${new Date(trip.createdAt).toLocaleDateString('en-IN',{month:'short',day:'numeric',year:'numeric'})}</span>
+        <h3>${escHtml(entry.tripName || 'Trip')}</h3>
+        <span class="invite-badge" title="Invite code">🔑 ${entry.inviteCode || '——'}</span>
       </div>
-      <div class="trip-progress">
-        <div class="progress-bar"><div class="progress-fill" style="width:${pct}%"></div></div>
-        <span class="progress-text">${done}/${trip.places.length} places visited</span>
-      </div>
-      <div class="trip-stats">
-        <div class="stat"><span class="stat-icon">📍</span><span>${trip.places.length} stops</span></div>
-        <div class="stat"><span class="stat-icon">👥</span><span>${trip.members.length} members</span></div>
-        <div class="stat"><span class="stat-icon">💰</span><span>₹${fmt(total)}</span></div>
+      <div class="trip-card-footer">
+        <span class="tap-hint">Tap to open →</span>
       </div>
     </div>`;
 }
 
 // =============================================
-// RENDER: TRIP VIEW
+// SECTION 12: TRIP VIEW
 // =============================================
 
 function renderTrip(tripId) {
-  const trip = state.trips.find(t => t.id === tripId);
-  if (!trip) { renderHome(); return; }
-  state.currentTripId = tripId;
+  S.myMemberId = getMemberId(tripId);
+  if (!S.myMemberId) { toast('Membership not found. Try joining again.', 'error'); renderHome(); return; }
 
   document.getElementById('app').innerHTML = `
     <div class="trip-view">
       <header class="trip-header">
         <button class="btn-back" onclick="goHome()">← Back</button>
         <div class="trip-title">
-          <h1>${escHtml(trip.name)}</h1>
-          <span class="trip-meta">${trip.places.length} places · ${trip.members.length} members</span>
+          <h1>${escHtml(getRegistry().find(r => r.tripId === tripId)?.tripName || 'Trip')}</h1>
+          <span class="trip-meta">Loading…</span>
         </div>
-        <button class="btn-icon danger" onclick="confirmDelete('${trip.id}')" title="Delete trip">🗑️</button>
+        <button class="btn-icon" onclick="showTripInfo()" title="Trip info &amp; invite code">🔗</button>
       </header>
       <div class="tabs">
-        <button class="tab active" onclick="switchTab('map')" id="tab-map">🗺️ Map</button>
-        <button class="tab" onclick="switchTab('itinerary')" id="tab-itinerary">📍 Itinerary</button>
-        <button class="tab" onclick="switchTab('expenses')" id="tab-expenses">💰 Expenses</button>
+        <button class="tab" onclick="switchTab('map')" id="tab-map">🗺️ Map</button>
+        <button class="tab" onclick="switchTab('itinerary')" id="tab-itinerary">📍 Stops</button>
+        <button class="tab active" onclick="switchTab('expenses')" id="tab-expenses">💬 Expenses</button>
         <button class="tab" onclick="switchTab('members')" id="tab-members">👥 Members</button>
-        <button class="tab" onclick="switchTab('settle')" id="tab-settle">🧾 Settle Up</button>
+        <button class="tab" onclick="switchTab('settle')" id="tab-settle">🧾 Settle</button>
       </div>
-      <div id="tab-body"></div>
+      <div id="tab-body" class="tab-body"></div>
     </div>
     <div id="modals"></div>
   `;
-  switchTab('map');
+
+  S.currentTab = 'expenses';
+  attachListeners(tripId);
+  rerenderTab();
 }
 
 function switchTab(name) {
+  S.currentTab = name;
   document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
-  const btn = document.getElementById('tab-' + name);
-  if (btn) btn.classList.add('active');
-  const body = document.getElementById('tab-body');
-  const trip = getCurrentTrip();
-  if (!trip || !body) return;
-  if (name === 'map') renderMapTab(trip, body);
-  else if (name === 'itinerary') renderItineraryTab(trip, body);
-  else if (name === 'expenses') renderExpensesTab(trip, body);
-  else if (name === 'members') renderMembersTab(trip, body);
-  else if (name === 'settle') renderSettleTab(trip, body);
+  document.getElementById('tab-' + name)?.classList.add('active');
+  rerenderTab();
 }
 
-// --- MAP TAB ---
-function renderMapTab(trip, el) {
-  const places = trip.places;
+// =============================================
+// SECTION 13: MAP TAB
+// =============================================
+
+function renderMapTab(el) {
+  const places = S.trip?.places || [];
   el.innerHTML = `
     <div class="map-tab">
       <div id="map" class="map-container"></div>
@@ -588,14 +689,18 @@ function renderMapTab(trip, el) {
             <span class="legend-number" style="background:${p.completed ? '#10b981' : '#6366f1'}">${i+1}</span>
             <span class="legend-name">${escHtml(p.name)}</span>
             ${p.completed ? '<span class="legend-check">✓</span>' : ''}
-          </div>`).join('') : '<span style="color:var(--text-muted);font-size:13px">No destinations yet. Add them in the Itinerary tab.</span>'}
+          </div>`).join('') : '<span style="color:var(--text-muted);font-size:13px">No destinations yet — add them in Stops tab.</span>'}
       </div>
     </div>`;
-  requestAnimationFrame(() => { initMap('map'); renderMap(trip); });
+  requestAnimationFrame(() => { initMap('map'); renderMap(places); });
 }
 
-// --- ITINERARY TAB ---
-function renderItineraryTab(trip, el) {
+// =============================================
+// SECTION 14: ITINERARY TAB
+// =============================================
+
+function renderItineraryTab(el) {
+  const places = S.trip?.places || [];
   el.innerHTML = `
     <div class="itinerary-tab">
       <div class="section-header">
@@ -603,180 +708,263 @@ function renderItineraryTab(trip, el) {
         <button class="btn-primary small" onclick="showAddPlaceModal()">+ Add Stop</button>
       </div>
       <div class="places-list">
-        ${!trip.places.length ? `<div class="empty-state small"><p>No destinations yet. Add your first stop!</p></div>` :
-          trip.places.map((p, i) => `
+        ${!places.length ? '<div class="empty-state small"><p>No stops yet. Add your first destination!</p></div>' :
+          places.map((p, i) => `
             <div class="place-item ${p.completed ? 'completed' : ''}">
               <div class="place-number">${i+1}</div>
-              <div class="place-checkbox" onclick="handleTogglePlace('${trip.id}','${p.id}')">
+              <div class="place-checkbox" onclick="handleTogglePlace('${p.id}')">
                 <div class="checkbox ${p.completed ? 'checked' : ''}">${p.completed ? '✓' : ''}</div>
               </div>
               <div class="place-info">
                 <span class="place-name">${escHtml(p.name)}</span>
                 ${p.completed ? '<span class="place-tag visited">Visited</span>' : ''}
-                ${!p.lat ? '<span class="place-tag" style="background:#fef3c7;color:#b45309">No coords</span>' : ''}
+                ${!p.lat ? '<span class="place-tag" style="background:#fef3c7;color:#b45309;font-size:10px">📍 no coords</span>' : ''}
               </div>
-              <button class="btn-icon small danger" onclick="handleRemovePlace('${trip.id}','${p.id}')">×</button>
+              <button class="btn-icon small danger" onclick="handleRemovePlace('${p.id}')">×</button>
             </div>`).join('')}
       </div>
     </div>`;
 }
 
-// --- EXPENSES TAB ---
-function renderExpensesTab(trip, el) {
-  const total = getTotalExpenses(trip);
+// =============================================
+// SECTION 15: EXPENSES (CHAT FEED)
+// =============================================
+
+function renderExpensesTab(el) {
+  const total = getTotalExpenses();
   el.innerHTML = `
-    <div class="expenses-tab">
-      <div class="expenses-summary">
-        <div class="summary-card">
-          <span class="summary-label">Total</span>
-          <span class="summary-amount">₹${fmt(total)}</span>
+    <div class="expenses-chat-view">
+      <div class="chat-summary-bar">
+        <span class="chat-total">Total: <strong>₹${fmt(total)}</strong></span>
+        <span class="chat-count">${S.expenses.length} expense${S.expenses.length !== 1 ? 's' : ''}</span>
+      </div>
+      <div class="chat-feed" id="chat-feed">
+        ${!S.expenses.length ? `
+          <div class="chat-empty">
+            <span>💬</span>
+            <p>No expenses yet.</p>
+            <p>Add the first one below!</p>
+          </div>` :
+          S.expenses.map(exp => buildBubble(exp)).join('')}
+      </div>
+      <div class="chat-input-bar">
+        <button class="chat-add-btn" onclick="showAddExpenseModal()" ${S.members.length === 0 ? 'disabled title="Add members first"' : ''}>
+          ${S.members.length === 0 ? '⚠️ Add members first to log expenses' : '+ Add Expense'}
+        </button>
+      </div>
+    </div>`;
+  // Scroll to bottom
+  requestAnimationFrame(() => {
+    const feed = document.getElementById('chat-feed');
+    if (feed) feed.scrollTop = feed.scrollHeight;
+  });
+}
+
+function buildBubble(exp) {
+  const isMe = exp.createdBy === S.myMemberId;
+  const payer = S.members.find(m => m.id === exp.paidBy);
+  const creator = S.members.find(m => m.id === exp.createdBy);
+  const isAdmin = S.trip?.adminDeviceId === getDeviceId();
+  const canDelete = isMe || isAdmin;
+
+  const payerLabel = exp.paidBy === S.myMemberId ? 'You paid' : `${escHtml(payer?.name || 'Someone')} paid`;
+  const creatorLabel = isMe ? 'You' : escHtml(creator?.name || '?');
+
+  const splitPills = (exp.splits || []).map(s => {
+    const m = S.members.find(m => m.id === s.memberId);
+    const highlight = s.memberId === S.myMemberId;
+    return m ? `<span class="chat-split-pill ${highlight ? 'is-me' : ''}">${s.memberId === S.myMemberId ? 'You' : escHtml(m.name)}: ₹${fmt(s.amount)}</span>` : '';
+  }).join('');
+
+  if (isMe) {
+    return `
+      <div class="chat-row chat-right" data-expense-id="${exp.id}">
+        <div class="chat-bubble chat-bubble-right">
+          <div class="chat-amount">${CAT_ICONS[exp.category] || '💰'} ₹${fmt(exp.amount)}</div>
+          <div class="chat-desc">${escHtml(exp.description)}</div>
+          <div class="chat-splits">${splitPills}</div>
+          <div class="chat-time">${payerLabel} · ${formatTime(exp.createdAt)}</div>
         </div>
-        ${trip.members.map(m => {
-          const paid = getMemberPaid(trip, m.id);
-          const share = getMemberShare(trip, m.id);
-          return `<div class="summary-card member-summary" style="border-left:4px solid ${m.color}">
-            <div class="member-avatar small" style="background:${m.color}">${initials(m.name)}</div>
-            <div class="summary-details">
-              <span class="summary-name">${escHtml(m.name)}</span>
-              <span class="summary-stats">Paid ₹${fmt(paid)} · Share ₹${fmt(share)}</span>
-            </div>
-          </div>`;
-        }).join('')}
+        ${canDelete ? `<button class="chat-delete btn-icon small danger" onclick="handleRemoveExpense('${exp.id}')">×</button>` : ''}
+      </div>`;
+  }
+
+  return `
+    <div class="chat-row chat-left" data-expense-id="${exp.id}">
+      <div class="chat-avatar" style="background:${creator?.color || payer?.color || '#6366f1'}" title="${escHtml(creator?.name || '')}">${initials(creator?.name || payer?.name)}</div>
+      <div class="chat-bubble chat-bubble-left">
+        <div class="chat-sender">${creatorLabel} added · ${payerLabel}</div>
+        <div class="chat-amount">${CAT_ICONS[exp.category] || '💰'} ₹${fmt(exp.amount)}</div>
+        <div class="chat-desc">${escHtml(exp.description)}</div>
+        <div class="chat-splits">${splitPills}</div>
+        <div class="chat-time">${formatTime(exp.createdAt)}</div>
       </div>
-      <div class="section-header">
-        <h2>Expenses</h2>
-        <button class="btn-primary small" onclick="showAddExpenseModal()" ${trip.members.length === 0 ? 'disabled title="Add members first"' : ''}>+ Add Expense</button>
-      </div>
-      ${!trip.expenses.length ? `<div class="empty-state small"><p>${trip.members.length === 0 ? 'Add members first, then add expenses.' : 'No expenses yet. Add your first one!'}</p></div>` : `
-      <div class="expenses-list">
-        ${[...trip.expenses].reverse().map(exp => {
-          const payer = trip.members.find(m => m.id === exp.paidBy);
-          return `<div class="expense-item">
-            <div class="expense-icon">${CAT_ICONS[exp.category] || '💰'}</div>
-            <div class="expense-info">
-              <span class="expense-name">${escHtml(exp.description)}</span>
-              <span class="expense-meta">${exp.date} · Paid by ${escHtml(payer?.name || 'Unknown')}</span>
-              <div class="expense-splits">
-                ${exp.splits.map(s => {
-                  const m = trip.members.find(m => m.id === s.memberId);
-                  return m ? `<span class="split-tag" style="background:${m.color}20;border:1px solid ${m.color}40;color:${m.color}">${escHtml(m.name)}: ₹${fmt(s.amount)}</span>` : '';
-                }).join('')}
-              </div>
-            </div>
-            <div class="expense-amount">₹${fmt(exp.amount)}</div>
-            <button class="btn-icon small danger" onclick="handleRemoveExpense('${trip.id}','${exp.id}')">×</button>
-          </div>`;
-        }).join('')}
-      </div>`}
+      ${canDelete ? `<button class="chat-delete btn-icon small danger" onclick="handleRemoveExpense('${exp.id}')">×</button>` : ''}
     </div>`;
 }
 
-// --- MEMBERS TAB ---
-function renderMembersTab(trip, el) {
+function appendNewBubbles(newExpenses) {
+  const feed = document.getElementById('chat-feed');
+  if (!feed) { rerenderTab(); return; }
+  // Remove empty state if present
+  feed.querySelector('.chat-empty')?.remove();
+  newExpenses.forEach(exp => {
+    const html = buildBubble(exp);
+    const div = document.createElement('div');
+    div.innerHTML = html.trim();
+    if (div.firstElementChild) feed.appendChild(div.firstElementChild);
+  });
+  feed.scrollTop = feed.scrollHeight;
+}
+
+// =============================================
+// SECTION 16: MEMBERS TAB
+// =============================================
+
+function renderMembersTab(el) {
+  const inviteCode = S.trip?.inviteCode;
   el.innerHTML = `
     <div class="members-tab">
-      <div class="section-header">
-        <h2>Members</h2>
-        <button class="btn-primary small" onclick="showAddMemberModal()">+ Add Member</button>
+      <div class="invite-card">
+        <div class="invite-label">Trip Invite Code</div>
+        <div class="invite-code">${inviteCode || '——'}</div>
+        <button class="btn-secondary small" onclick="copyInviteCode('${inviteCode}')">📋 Copy Code</button>
+        <button class="btn-secondary small" onclick="shareInviteLink('${inviteCode}')">🔗 Share Link</button>
       </div>
-      ${!trip.members.length ? `<div class="empty-state small"><p>No members yet. Add people to split expenses!</p></div>` : `
+      <div class="section-header" style="margin-top:20px">
+        <h2>Members (${S.members.length})</h2>
+      </div>
+      ${!S.members.length ? '<div class="empty-state small"><p>No members yet.</p></div>' : `
       <div class="members-list">
-        ${trip.members.map(m => {
-          const paid = getMemberPaid(trip, m.id);
-          const share = getMemberShare(trip, m.id);
-          const bal = calcBalances(trip)[m.id] || 0;
+        ${S.members.map(m => {
+          const bal = calcBalances()[m.id] || 0;
+          const isMe = m.deviceId === getDeviceId();
           return `<div class="member-card">
             <div class="member-avatar large" style="background:${m.color}">${initials(m.name)}</div>
             <div class="member-info">
-              <h3 class="member-name">${escHtml(m.name)}</h3>
+              <h3 class="member-name">${escHtml(m.name)} ${isMe ? '<span class="you-badge">You</span>' : ''} ${m.isAdmin ? '<span class="admin-badge">Admin</span>' : ''}</h3>
               <p class="member-upi">${m.upiId ? '📱 ' + escHtml(m.upiId) : '⚠️ No UPI ID'}</p>
               <div class="member-stats">
-                <span class="stat-item"><span class="stat-label">Paid</span><span class="stat-val">₹${fmt(paid)}</span></span>
+                <span class="stat-item"><span class="stat-label">Paid</span><span class="stat-val">₹${fmt(getMemberPaid(m.id))}</span></span>
                 <span class="stat-divider">·</span>
-                <span class="stat-item"><span class="stat-label">Share</span><span class="stat-val">₹${fmt(share)}</span></span>
+                <span class="stat-item"><span class="stat-label">Share</span><span class="stat-val">₹${fmt(getMemberShare(m.id))}</span></span>
                 <span class="stat-divider">·</span>
                 <span class="stat-item"><span class="stat-label">Balance</span>
                   <span class="stat-val ${bal > 0.01 ? 'positive' : bal < -0.01 ? 'negative' : ''}">${bal >= 0 ? '+' : ''}₹${fmt(Math.abs(bal))}</span>
                 </span>
               </div>
             </div>
-            <button class="btn-icon danger" onclick="handleRemoveMember('${trip.id}','${m.id}')">🗑️</button>
+            <div style="display:flex;flex-direction:column;gap:6px">
+              ${isMe ? `<button class="btn-secondary small" onclick="showEditMemberModal('${m.id}')">Edit</button>` : ''}
+              ${(S.trip?.adminDeviceId === getDeviceId() && !isMe) ? `<button class="btn-icon small danger" onclick="handleRemoveMember('${m.id}')">🗑️</button>` : ''}
+            </div>
           </div>`;
         }).join('')}
       </div>`}
     </div>`;
 }
 
-// --- SETTLE TAB ---
-function renderSettleTab(trip, el) {
-  const debts = simplifyDebts(trip);
-  const total = getTotalExpenses(trip);
-  const bal = calcBalances(trip);
+function copyInviteCode(code) {
+  if (!code) return;
+  navigator.clipboard.writeText(code).then(() => toast('Invite code copied!', 'success')).catch(() => {
+    prompt('Copy this invite code:', code);
+  });
+}
+
+function shareInviteLink(code) {
+  if (!code) return;
+  const url = `${location.origin}${location.pathname}?join=${code}`;
+  if (navigator.share) {
+    navigator.share({ title: 'Join my Tripppyyy trip!', text: `Use code ${code} or open this link:`, url });
+  } else {
+    navigator.clipboard.writeText(url).then(() => toast('Link copied!', 'success')).catch(() => prompt('Share this link:', url));
+  }
+}
+
+// =============================================
+// SECTION 17: SETTLE UP TAB
+// =============================================
+
+function renderSettleTab(el) {
+  const debts = simplifyDebts();
+  const bal = calcBalances();
+  const total = getTotalExpenses();
 
   el.innerHTML = `
     <div class="settlement-tab">
       <div class="settlement-summary">
-        <h2>Settlement Summary</h2>
-        <p class="summary-total">Total trip cost: <strong>₹${fmt(total)}</strong> · ${trip.members.length} members</p>
+        <h2>Settlement</h2>
+        <p class="summary-total">Trip total: <strong>₹${fmt(total)}</strong> · ${S.members.length} members</p>
       </div>
 
       <div class="balances-section">
         <h3>Individual Balances</h3>
         <div class="balances-grid">
-          ${trip.members.map(m => {
+          ${S.members.map(m => {
             const b = bal[m.id] || 0;
             const cls = b > 0.01 ? 'creditor' : b < -0.01 ? 'debtor' : 'settled';
-            const ind = b > 0.01 ? 'up' : b < -0.01 ? 'down' : 'neutral';
+            const isMe = m.deviceId === getDeviceId();
             return `<div class="balance-card ${cls}">
               <div class="member-avatar" style="background:${m.color}">${initials(m.name)}</div>
               <div class="balance-info">
-                <span class="balance-name">${escHtml(m.name)}</span>
+                <span class="balance-name">${escHtml(m.name)}${isMe ? ' <span class="you-badge">You</span>' : ''}</span>
                 <span class="balance-amount ${b > 0.01 ? 'positive' : b < -0.01 ? 'negative' : ''}">
                   ${b > 0.01 ? `gets back ₹${fmt(b)}` : b < -0.01 ? `owes ₹${fmt(Math.abs(b))}` : 'all settled!'}
                 </span>
               </div>
-              <div class="balance-indicator ${ind}">${ind === 'up' ? '↑' : ind === 'down' ? '↓' : '✓'}</div>
+              <div class="balance-indicator ${b > 0.01 ? 'up' : b < -0.01 ? 'down' : 'neutral'}">${b > 0.01 ? '↑' : b < -0.01 ? '↓' : '✓'}</div>
             </div>`;
           }).join('')}
         </div>
       </div>
 
       <div class="settlements-section">
-        <h3>Payments to Settle</h3>
+        <h3>Payments Needed</h3>
         ${!debts.length ? `
           <div class="all-settled">
             <span class="settled-icon">🎉</span>
-            <p>${!trip.members.length ? 'Add members and expenses to see settlements.' : 'All settled! No payments needed.'}</p>
+            <p>${!S.members.length ? 'Add members and expenses first.' : 'All settled! No payments needed.'}</p>
           </div>` : `
         <div class="debts-list">
           ${debts.map(d => {
-            const from = trip.members.find(m => m.id === d.from);
-            const to = trip.members.find(m => m.id === d.to);
-            return `<div class="debt-card">
+            const from = S.members.find(m => m.id === d.from);
+            const to = S.members.find(m => m.id === d.to);
+            const isMyDebt = from?.deviceId === getDeviceId();
+            return `<div class="debt-card ${isMyDebt ? 'my-debt' : ''}">
+              ${isMyDebt ? '<div class="debt-highlight-bar">You need to pay</div>' : ''}
               <div class="debt-flow">
                 <div class="debt-member">
-                  <div class="member-avatar" style="background:${from?.color || '#ccc'}">${initials(from?.name)}</div>
-                  <span>${escHtml(from?.name || '?')}</span>
+                  <div class="member-avatar" style="background:${from?.color}">${initials(from?.name)}</div>
+                  <span>${from?.deviceId === getDeviceId() ? 'You' : escHtml(from?.name)}</span>
                 </div>
                 <div class="debt-arrow">
                   <span class="debt-amount">₹${fmt(d.amount)}</span>
                   <span class="arrow">→</span>
                 </div>
                 <div class="debt-member">
-                  <div class="member-avatar" style="background:${to?.color || '#ccc'}">${initials(to?.name)}</div>
-                  <span>${escHtml(to?.name || '?')}</span>
+                  <div class="member-avatar" style="background:${to?.color}">${initials(to?.name)}</div>
+                  <span>${escHtml(to?.name)}</span>
                 </div>
               </div>
-              <div class="debt-actions">${buildPayButtons(to, d.amount, trip.name)}</div>
+              <div class="debt-actions">${buildPayButtons(to, d.amount, S.trip?.name || 'Trip')}</div>
             </div>`;
           }).join('')}
         </div>`}
       </div>
+
+      ${S.trip?.adminDeviceId === getDeviceId() ? `
+        <div class="danger-zone">
+          <h3>Danger Zone</h3>
+          <button class="btn-danger" onclick="confirmDeleteTrip('${S.trip?.id}')">🗑️ Delete This Trip</button>
+        </div>` : `
+        <div class="danger-zone">
+          <button class="btn-danger secondary" onclick="confirmLeaveTrip('${S.trip?.id}')">🚪 Leave This Trip</button>
+        </div>`}
     </div>`;
 }
 
 // =============================================
-// MODALS
+// SECTION 18: MODALS
 // =============================================
 
 function showNewTripModal() {
@@ -787,40 +975,42 @@ function showNewTripModal() {
 }
 function hideNewTripModal() { document.getElementById('new-trip-modal').classList.add('hidden'); }
 
-function modal(id, title, bodyHtml, footerHtml) {
+function modal(id, title, body, footer) {
   closeModal(id);
   const el = document.createElement('div');
   el.id = id; el.className = 'modal';
   el.innerHTML = `
     <div class="modal-overlay" onclick="closeModal('${id}')"></div>
     <div class="modal-content">
-      <div class="modal-header">
-        <h2>${title}</h2>
-        <button class="btn-close" onclick="closeModal('${id}')">×</button>
-      </div>
-      <div class="modal-body">${bodyHtml}</div>
-      <div class="modal-footer">${footerHtml}</div>
+      <div class="modal-header"><h2>${title}</h2><button class="btn-close" onclick="closeModal('${id}')">×</button></div>
+      <div class="modal-body">${body}</div>
+      <div class="modal-footer">${footer}</div>
     </div>`;
   (document.getElementById('modals') || document.body).appendChild(el);
 }
 
 function closeModal(id) { document.getElementById(id)?.remove(); }
 
-function showAddMemberModal() {
-  modal('add-member-modal', '👤 Add Member',
+function showJoinModal() {
+  modal('join-modal', '🔗 Join a Trip',
     `<div class="form-group">
-      <label>Name *</label>
-      <input type="text" id="m-name" placeholder="e.g., Rahul Sharma" class="form-input">
+      <label>Invite Code *</label>
+      <input type="text" id="j-code" placeholder="e.g., GOA123" class="form-input" style="text-transform:uppercase;letter-spacing:4px;font-size:20px;text-align:center" oninput="this.value=this.value.toUpperCase()">
     </div>
-    <div class="form-group">
-      <label>UPI ID (for payments)</label>
-      <input type="text" id="m-upi" placeholder="e.g., rahul@paytm or 9876543210@upi" class="form-input">
-      <p class="input-hint">Used for Pay Now buttons in settlements</p>
+    <div class="form-row">
+      <div class="form-group flex-1">
+        <label>Your Name *</label>
+        <input type="text" id="j-name" placeholder="How others see you" class="form-input" value="${escHtml(localStorage.getItem('tpyyy_myname') || '')}">
+      </div>
+      <div class="form-group flex-1">
+        <label>Your UPI ID</label>
+        <input type="text" id="j-upi" placeholder="you@upi" class="form-input" value="${escHtml(localStorage.getItem('tpyyy_myupi') || '')}">
+      </div>
     </div>`,
-    `<button class="btn-ghost" onclick="closeModal('add-member-modal')">Cancel</button>
-     <button class="btn-primary" onclick="doAddMember()">Add Member</button>`
+    `<button class="btn-ghost" onclick="closeModal('join-modal')">Cancel</button>
+     <button class="btn-primary" id="join-ok" onclick="doJoinTrip()">Join Trip</button>`
   );
-  requestAnimationFrame(() => document.getElementById('m-name')?.focus());
+  requestAnimationFrame(() => document.getElementById('j-code')?.focus());
 }
 
 function showAddPlaceModal() {
@@ -828,7 +1018,7 @@ function showAddPlaceModal() {
     `<div class="form-group">
       <label>Place Name *</label>
       <input type="text" id="p-name" placeholder="e.g., Anjuna Beach, Goa" class="form-input">
-      <p class="input-hint">We'll automatically find the location on the map</p>
+      <p class="input-hint">We'll automatically locate this on the map</p>
     </div>`,
     `<button class="btn-ghost" onclick="closeModal('add-place-modal')">Cancel</button>
      <button class="btn-primary" id="add-place-ok" onclick="doAddPlace()">Add Stop</button>`
@@ -836,11 +1026,28 @@ function showAddPlaceModal() {
   requestAnimationFrame(() => document.getElementById('p-name')?.focus());
 }
 
-function showAddExpenseModal() {
-  const trip = getCurrentTrip();
-  if (!trip || !trip.members.length) { toast('Add members first', 'warning'); return; }
-  currentSplitType = 'equal';
+function showEditMemberModal(memberId) {
+  const m = S.members.find(m => m.id === memberId);
+  if (!m) return;
+  const isMe = m.deviceId === getDeviceId();
+  modal('edit-member-modal', `✏️ Edit ${escHtml(m.name)}`,
+    `<div class="form-group">
+      <label>Name</label>
+      <input type="text" id="em-name" value="${escHtml(m.name)}" class="form-input" ${isMe ? '' : 'disabled'}>
+    </div>
+    <div class="form-group">
+      <label>UPI ID</label>
+      <input type="text" id="em-upi" value="${escHtml(m.upiId || '')}" placeholder="e.g., name@paytm" class="form-input">
+      <p class="input-hint">Used for Pay Now buttons in Settle Up</p>
+    </div>`,
+    `<button class="btn-ghost" onclick="closeModal('edit-member-modal')">Cancel</button>
+     <button class="btn-primary" onclick="doUpdateMember('${memberId}', ${isMe})">Save</button>`
+  );
+}
 
+function showAddExpenseModal() {
+  if (!S.members.length) { toast('Add members first', 'warning'); return; }
+  currentSplitType = 'equal';
   const cats = [['food','🍽️ Food'],['transport','🚗 Transport'],['hotel','🏨 Hotel'],['activity','🎯 Activity'],['fuel','⛽ Fuel'],['shopping','🛍️ Shopping'],['medical','💊 Medical'],['general','💰 General']];
 
   const body = `
@@ -851,21 +1058,19 @@ function showAddExpenseModal() {
       </div>
       <div class="form-group" style="min-width:130px">
         <label>Amount (₹) *</label>
-        <input type="number" id="e-amt" placeholder="0.00" class="form-input" min="0" step="0.01" oninput="updateSplits()">
+        <input type="number" id="e-amt" placeholder="0" class="form-input" min="0" step="0.01" oninput="updateSplits()">
       </div>
     </div>
     <div class="form-row">
       <div class="form-group flex-1">
         <label>Paid by *</label>
         <select id="e-paidby" class="form-input">
-          ${trip.members.map(m => `<option value="${m.id}">${escHtml(m.name)}</option>`).join('')}
+          ${S.members.map(m => `<option value="${m.id}" ${m.id === S.myMemberId ? 'selected' : ''}>${escHtml(m.name)}${m.id === S.myMemberId ? ' (You)' : ''}</option>`).join('')}
         </select>
       </div>
       <div class="form-group flex-1">
         <label>Category</label>
-        <select id="e-cat" class="form-input">
-          ${cats.map(([v,l]) => `<option value="${v}">${l}</option>`).join('')}
-        </select>
+        <select id="e-cat" class="form-input">${cats.map(([v, l]) => `<option value="${v}">${l}</option>`).join('')}</select>
       </div>
       <div class="form-group" style="min-width:130px">
         <label>Date</label>
@@ -876,89 +1081,92 @@ function showAddExpenseModal() {
       <label>Split Type</label>
       <div class="split-type-selector">
         <button class="split-type-btn active" id="stype-equal" onclick="setSplitType('equal')">⚖️ Equal</button>
-        <button class="split-type-btn" id="stype-custom" onclick="setSplitType('custom')">✏️ Custom Amount</button>
+        <button class="split-type-btn" id="stype-custom" onclick="setSplitType('custom')">✏️ Custom</button>
         <button class="split-type-btn" id="stype-percentage" onclick="setSplitType('percentage')">% By %</button>
       </div>
     </div>
     <div class="form-group">
       <label>Split Among</label>
-      <div id="split-rows">${buildSplitRows(trip, 'equal', 0)}</div>
+      <div id="split-rows">${buildSplitRows('equal', 0)}</div>
     </div>`;
 
   modal('add-expense-modal', '💰 Add Expense', body,
     `<button class="btn-ghost" onclick="closeModal('add-expense-modal')">Cancel</button>
      <button class="btn-primary" onclick="doAddExpense()">Add Expense</button>`
   );
-
-  // Need large modal
   requestAnimationFrame(() => {
     document.querySelector('#add-expense-modal .modal-content')?.classList.add('large-modal');
     document.getElementById('e-desc')?.focus();
   });
 }
 
-function buildSplitRows(trip, type, total) {
-  const n = trip.members.length;
+let currentSplitType = 'equal';
+
+function buildSplitRows(type, total) {
+  const n = S.members.length;
   const eq = n > 0 ? total / n : 0;
-  return trip.members.map(m => `
+  return S.members.map(m => `
     <div class="split-row" data-mid="${m.id}">
       <label class="split-member-label">
         <input type="checkbox" class="split-cb" data-mid="${m.id}" checked onchange="updateSplits()">
         <div class="member-avatar tiny" style="background:${m.color}">${initials(m.name)}</div>
-        <span>${escHtml(m.name)}</span>
+        <span>${escHtml(m.name)}${m.id === S.myMemberId ? ' <span class="you-badge">You</span>' : ''}</span>
       </label>
-      ${type === 'equal' ? `<span class="split-amount-display" id="sd-${m.id}">₹${fmt(eq)}</span>`
-        : type === 'custom' ? `<input type="number" class="split-custom form-input small" id="sc-${m.id}" value="${fmt(eq)}" min="0" step="0.01" oninput="checkSplitTotal()">`
+      ${type === 'equal'
+        ? `<span class="split-amount-display" id="sd-${m.id}">₹${fmt(eq)}</span>`
+        : type === 'custom'
+        ? `<input type="number" class="split-custom form-input small" id="sc-${m.id}" value="${fmt(eq)}" min="0" step="0.01" oninput="checkSplitTotal()">`
         : `<div class="split-percentage"><input type="number" class="split-pct form-input small" id="sc-${m.id}" value="${Math.round(100/n)}" min="0" max="100" oninput="updateSplits()"><span>%</span></div>`}
     </div>`).join('');
 }
 
 function setSplitType(type) {
   currentSplitType = type;
-  ['equal','custom','percentage'].forEach(t => document.getElementById('stype-' + t)?.classList.toggle('active', t === type));
-  const trip = getCurrentTrip();
+  ['equal', 'custom', 'percentage'].forEach(t => document.getElementById('stype-' + t)?.classList.toggle('active', t === type));
   const amt = parseFloat(document.getElementById('e-amt')?.value || 0);
   const el = document.getElementById('split-rows');
-  if (el && trip) el.innerHTML = buildSplitRows(trip, type, amt);
+  if (el) el.innerHTML = buildSplitRows(type, amt);
 }
 
 function updateSplits() {
-  const trip = getCurrentTrip();
-  if (!trip) return;
   const amt = parseFloat(document.getElementById('e-amt')?.value || 0);
   if (currentSplitType === 'equal') {
     const checked = Array.from(document.querySelectorAll('.split-cb:checked'));
     const share = checked.length > 0 ? amt / checked.length : 0;
-    trip.members.forEach(m => {
+    S.members.forEach(m => {
       const el = document.getElementById('sd-' + m.id);
       const cb = document.querySelector(`.split-cb[data-mid="${m.id}"]`);
       if (el) el.textContent = `₹${fmt(cb?.checked ? share : 0)}`;
-    });
-  } else if (currentSplitType === 'percentage') {
-    trip.members.forEach(m => {
-      const input = document.getElementById('sc-' + m.id);
-      const pct = parseFloat(input?.value || 0);
-      const display = document.getElementById('sd-' + m.id);
-      if (display) display.textContent = `₹${fmt(amt * pct / 100)}`;
     });
   }
 }
 
 function checkSplitTotal() {
-  // Visual validation for custom split
-  const trip = getCurrentTrip();
-  if (!trip) return;
   const amt = parseFloat(document.getElementById('e-amt')?.value || 0);
   let total = 0;
-  trip.members.forEach(m => { total += parseFloat(document.getElementById('sc-' + m.id)?.value || 0); });
-  const diff = Math.abs(total - amt);
+  S.members.forEach(m => { total += parseFloat(document.getElementById('sc-' + m.id)?.value || 0); });
   document.querySelectorAll('.split-custom').forEach(el => {
-    el.style.borderColor = diff < 0.02 ? 'var(--success)' : 'var(--warning)';
+    el.style.borderColor = Math.abs(total - amt) < 0.02 ? 'var(--success)' : 'var(--warning)';
   });
 }
 
+function showTripInfo() {
+  const code = S.trip?.inviteCode;
+  modal('trip-info-modal', '🔗 Trip Info',
+    `<div class="trip-info-content">
+      <p>Share this code with friends so they can join:</p>
+      <div class="big-invite-code">${code || '——'}</div>
+      <p class="input-hint">Or share the link:</p>
+      <p class="input-hint" style="word-break:break-all">${location.origin}${location.pathname}?join=${code}</p>
+    </div>`,
+    `<button class="btn-ghost" onclick="closeModal('trip-info-modal')">Close</button>
+     <button class="btn-primary" onclick="copyInviteCode('${code}');closeModal('trip-info-modal')">📋 Copy Code</button>
+     <button class="btn-secondary" onclick="shareInviteLink('${code}')">🔗 Share Link</button>`
+  );
+}
+
 // =============================================
-// NEW TRIP MODAL HELPERS
+// SECTION 19: NEW TRIP HELPERS
 // =============================================
 
 function addPlaceInput() {
@@ -968,7 +1176,7 @@ function addPlaceInput() {
   const div = document.createElement('div');
   div.className = 'place-input-row';
   div.innerHTML = `<span class="place-index">${i + 1}</span>
-    <input type="text" placeholder="Enter place name..." class="form-input place-name-input" onkeydown="if(event.key==='Enter')addPlaceInput()">
+    <input type="text" placeholder="Enter place name…" class="form-input place-name-input" onkeydown="if(event.key==='Enter')addPlaceInput()">
     <button class="btn-icon small danger" onclick="removePlaceRow(this)">×</button>`;
   list.appendChild(div);
   div.querySelector('input').focus();
@@ -983,16 +1191,12 @@ async function fetchFromUrl() {
   const urlEl = document.getElementById('maps-url');
   const btn = document.getElementById('fetch-btn');
   const url = urlEl?.value?.trim();
-  if (!url) { toast('Please paste a Google Maps URL', 'warning'); return; }
-
-  btn.textContent = '⏳ Fetching...';
-  btn.disabled = true;
-
+  if (!url) { toast('Paste a Google Maps URL first', 'warning'); return; }
+  btn.textContent = '⏳…'; btn.disabled = true;
   try {
     const places = await parseGoogleMapsUrl(url);
-    if (!places.length) {
-      toast('Could not extract places — please add manually', 'warning');
-    } else {
+    if (!places.length) { toast('No places found — add manually', 'warning'); }
+    else {
       const list = document.getElementById('places-input-list');
       list.innerHTML = '';
       places.forEach(p => {
@@ -1006,87 +1210,81 @@ async function fetchFromUrl() {
       });
       const nameEl = document.getElementById('trip-name');
       if (nameEl && !nameEl.value.trim()) nameEl.value = places.slice(0, 3).join(' → ').slice(0, 55);
-      toast(`Found ${places.length} destinations!`, 'success');
+      toast(`Imported ${places.length} destinations!`, 'success');
     }
-  } catch (e) {
-    toast('Error fetching places', 'error');
-  }
-
-  btn.textContent = 'Fetch Places';
-  btn.disabled = false;
-}
-
-async function doCreateTrip() {
-  const name = document.getElementById('trip-name')?.value?.trim();
-  if (!name) { toast('Please enter a trip name', 'warning'); document.getElementById('trip-name')?.focus(); return; }
-
-  const inputs = Array.from(document.querySelectorAll('.place-name-input'));
-  const placeNames = inputs.map(i => i.value.trim()).filter(Boolean);
-  if (!placeNames.length) { toast('Add at least one destination', 'warning'); return; }
-
-  const btn = document.getElementById('create-trip-btn');
-  btn.textContent = '⏳ Geocoding...';
-  btn.disabled = true;
-  hideNewTripModal();
-
-  toast('Creating trip and finding locations...', 'info');
-
-  const geocoded = await geocodePlaces(placeNames, (i, total, name) => {
-    toast(`Finding "${name}" (${i+1}/${total})...`, 'info');
-  });
-
-  const trip = createTrip(name, geocoded);
-  const notFound = geocoded.filter(p => !p.found);
-  if (notFound.length) toast(`Created! ${notFound.length} place(s) not found on map.`, 'warning');
-  else toast('Trip created successfully!', 'success');
-
-  renderTrip(trip.id);
+  } catch (e) { toast('Could not import — add manually', 'error'); }
+  btn.textContent = 'Import'; btn.disabled = false;
 }
 
 // =============================================
-// EVENT HANDLERS
+// SECTION 20: EVENT HANDLERS
 // =============================================
 
 function goHome() {
-  state.currentTripId = null;
-  if (mapInstance) { try { mapInstance.remove(); } catch(_){} mapInstance = null; }
+  detachListeners();
+  S.trip = null; S.members = []; S.expenses = []; S.myMemberId = null;
+  if (mapInstance) { try { mapInstance.remove(); } catch (_) {} mapInstance = null; }
   renderHome();
 }
 
-function openTrip(id) { renderTrip(id); }
+function openTrip(tripId) { renderTrip(tripId); }
 
-function confirmDelete(id) {
-  const trip = state.trips.find(t => t.id === id);
-  if (confirm(`Delete "${trip?.name}"? This cannot be undone.`)) {
-    deleteTrip(id); goHome(); toast('Trip deleted', 'info');
+async function doCreateTrip() {
+  const name = document.getElementById('trip-name')?.value?.trim();
+  const creatorName = document.getElementById('creator-name')?.value?.trim();
+  const creatorUpi = document.getElementById('creator-upi')?.value?.trim();
+  if (!name) { toast('Enter a trip name', 'warning'); return; }
+  if (!creatorName) { toast('Enter your name', 'warning'); document.getElementById('creator-name')?.focus(); return; }
+
+  const placeNames = Array.from(document.querySelectorAll('.place-name-input'))
+    .map(i => i.value.trim()).filter(Boolean);
+
+  const btn = document.getElementById('create-trip-btn');
+  btn.textContent = '⏳ Creating…'; btn.disabled = true;
+  hideNewTripModal();
+
+  localStorage.setItem('tpyyy_myname', creatorName);
+  if (creatorUpi) localStorage.setItem('tpyyy_myupi', creatorUpi);
+
+  let geocoded = [];
+  if (placeNames.length) {
+    toast('Finding locations on map…', 'info');
+    geocoded = await geocodePlaces(placeNames, (i, total, n) => toast(`Locating "${n}" (${i+1}/${total})…`, 'info'));
+  }
+
+  try {
+    const { tripId, memberId, inviteCode } = await dbCreateTrip(name, geocoded, creatorName, creatorUpi);
+    saveToRegistry({ tripId, memberId, tripName: name, inviteCode });
+    toast(`Trip created! Invite code: ${inviteCode}`, 'success');
+    renderTrip(tripId);
+  } catch (e) {
+    toast('Error creating trip: ' + e.message, 'error');
+    btn.textContent = 'Create Trip'; btn.disabled = false;
   }
 }
 
-function handleTogglePlace(tripId, placeId) {
-  togglePlace(tripId, placeId);
-  switchTab('itinerary');
-}
+async function doJoinTrip() {
+  const code = document.getElementById('j-code')?.value?.trim();
+  const name = document.getElementById('j-name')?.value?.trim();
+  const upi = document.getElementById('j-upi')?.value?.trim();
+  if (!code) { toast('Enter an invite code', 'warning'); return; }
+  if (!name) { toast('Enter your name', 'warning'); return; }
 
-function handleRemovePlace(tripId, placeId) {
-  removePlace(tripId, placeId);
-  switchTab('itinerary');
-}
+  const btn = document.getElementById('join-ok');
+  btn.textContent = '⏳ Joining…'; btn.disabled = true;
 
-function handleRemoveMember(tripId, memberId) {
-  const trip = state.trips.find(t => t.id === tripId);
-  const m = trip?.members.find(m => m.id === memberId);
-  if (confirm(`Remove ${m?.name} from this trip?`)) {
-    removeMember(tripId, memberId);
-    switchTab('members');
-    toast(`${m?.name} removed`, 'info');
-  }
-}
+  localStorage.setItem('tpyyy_myname', name);
+  if (upi) localStorage.setItem('tpyyy_myupi', upi);
 
-function handleRemoveExpense(tripId, expId) {
-  if (confirm('Remove this expense?')) {
-    removeExpense(tripId, expId);
-    switchTab('expenses');
-    toast('Expense removed', 'info');
+  try {
+    const { tripId, memberId, tripName, inviteCode } = await dbJoinTrip(code, name, upi);
+    saveToRegistry({ tripId, memberId, tripName: tripName || 'Trip', inviteCode: inviteCode || code });
+    closeModal('join-modal');
+    toast('Joined trip!', 'success');
+    renderTrip(tripId);
+  } catch (e) {
+    toast(e.message || 'Could not join trip', 'error');
+    btn.textContent = 'Join Trip'; btn.disabled = false;
   }
 }
 
@@ -1094,27 +1292,26 @@ async function doAddPlace() {
   const name = document.getElementById('p-name')?.value?.trim();
   if (!name) { toast('Enter a place name', 'warning'); return; }
   const btn = document.getElementById('add-place-ok');
-  if (btn) { btn.textContent = '⏳ Finding...'; btn.disabled = true; }
+  if (btn) { btn.textContent = '⏳ Locating…'; btn.disabled = true; }
   const coords = await geocodePlace(name);
-  addPlace(state.currentTripId, { name, lat: coords?.lat, lng: coords?.lng });
+  await dbAddPlace(S.trip.id, { name, lat: coords?.lat, lng: coords?.lng });
   closeModal('add-place-modal');
-  switchTab('itinerary');
-  toast(coords ? 'Stop added!' : 'Stop added (location not found on map)', coords ? 'success' : 'warning');
+  toast(coords ? 'Stop added!' : 'Stop added (not found on map)', coords ? 'success' : 'warning');
 }
 
-function doAddMember() {
-  const name = document.getElementById('m-name')?.value?.trim();
-  const upiId = document.getElementById('m-upi')?.value?.trim();
-  if (!name) { toast('Enter a name', 'warning'); return; }
-  addMember(state.currentTripId, { name, upiId });
-  closeModal('add-member-modal');
-  switchTab('members');
-  toast(`${name} added!`, 'success');
+async function doUpdateMember(memberId, isMe) {
+  const name = document.getElementById('em-name')?.value?.trim();
+  const upi = document.getElementById('em-upi')?.value?.trim();
+  const update = { upiId: upi || '' };
+  if (isMe && name) update.name = name;
+  await dbUpdateMember(S.trip.id, memberId, update);
+  if (isMe && name) localStorage.setItem('tpyyy_myname', name);
+  if (upi) localStorage.setItem('tpyyy_myupi', upi);
+  closeModal('edit-member-modal');
+  toast('Updated!', 'success');
 }
 
-function doAddExpense() {
-  const trip = getCurrentTrip();
-  if (!trip) return;
+async function doAddExpense() {
   const desc = document.getElementById('e-desc')?.value?.trim();
   const amt = parseFloat(document.getElementById('e-amt')?.value || 0);
   const paidBy = document.getElementById('e-paidby')?.value;
@@ -1125,20 +1322,19 @@ function doAddExpense() {
   if (!amt || amt <= 0) { toast('Enter a valid amount', 'warning'); return; }
 
   const splits = [];
-
   if (currentSplitType === 'equal') {
     const checked = Array.from(document.querySelectorAll('.split-cb:checked'));
     if (!checked.length) { toast('Select at least one person', 'warning'); return; }
-    const share = round2(amt / checked.length);
-    let remaining = amt;
+    const share = amt / checked.length;
+    let rem = amt;
     checked.forEach((cb, i) => {
-      const s = i === checked.length - 1 ? round2(remaining) : share;
-      remaining = round2(remaining - share);
+      const s = i === checked.length - 1 ? round2(rem) : round2(share);
+      rem = round2(rem - round2(share));
       splits.push({ memberId: cb.dataset.mid, amount: s });
     });
   } else if (currentSplitType === 'custom') {
     let total = 0;
-    trip.members.forEach(m => {
+    S.members.forEach(m => {
       const v = parseFloat(document.getElementById('sc-' + m.id)?.value || 0);
       if (v > 0) { splits.push({ memberId: m.id, amount: v }); total += v; }
     });
@@ -1146,27 +1342,106 @@ function doAddExpense() {
     if (Math.abs(total - amt) > 0.05) { toast(`Splits (₹${fmt(total)}) don't match total (₹${fmt(amt)})`, 'warning'); return; }
   } else {
     let pctTotal = 0;
-    trip.members.forEach(m => {
+    S.members.forEach(m => {
       const pct = parseFloat(document.getElementById('sc-' + m.id)?.value || 0);
       if (pct > 0) { splits.push({ memberId: m.id, amount: round2(amt * pct / 100) }); pctTotal += pct; }
     });
     if (!splits.length) { toast('Add percentages', 'warning'); return; }
-    if (Math.abs(pctTotal - 100) > 1) { toast(`Percentages add up to ${pctTotal}%, need 100%`, 'warning'); return; }
+    if (Math.abs(pctTotal - 100) > 1) { toast(`Percentages total ${pctTotal}%, need 100%`, 'warning'); return; }
   }
 
-  addExpense(trip.id, { description: desc, amount: amt, paidBy, splits, date, category: cat });
+  const btn = document.querySelector('#add-expense-modal .btn-primary');
+  if (btn) { btn.textContent = '⏳ Adding…'; btn.disabled = true; }
+
+  await dbAddExpense(S.trip.id, { description: desc, amount: amt, paidBy, splits, date, category: cat });
   closeModal('add-expense-modal');
-  switchTab('expenses');
   toast('Expense added!', 'success');
 }
 
+async function handleTogglePlace(placeId) {
+  await dbTogglePlace(S.trip.id, placeId);
+}
+
+async function handleRemovePlace(placeId) {
+  await dbRemovePlace(S.trip.id, placeId);
+}
+
+async function handleRemoveMember(memberId) {
+  const m = S.members.find(m => m.id === memberId);
+  if (confirm(`Remove ${m?.name} from this trip?`)) {
+    await dbRemoveMember(S.trip.id, memberId);
+    toast(`${m?.name} removed`, 'info');
+  }
+}
+
+async function handleRemoveExpense(expenseId) {
+  if (confirm('Delete this expense?')) {
+    await dbRemoveExpense(S.trip.id, expenseId);
+    toast('Expense deleted', 'info');
+  }
+}
+
+async function confirmDeleteTrip(tripId) {
+  if (confirm(`Delete "${S.trip?.name}" for ALL members? This cannot be undone.`)) {
+    await dbLeaveOrDeleteTrip(tripId);
+    goHome();
+    toast('Trip deleted', 'info');
+  }
+}
+
+async function confirmLeaveTrip(tripId) {
+  if (confirm('Leave this trip? You can rejoin with the invite code.')) {
+    await dbLeaveOrDeleteTrip(tripId);
+    goHome();
+    toast('Left trip', 'info');
+  }
+}
+
 // =============================================
-// APP INIT
+// SECTION 21: APP INITIALIZATION
 // =============================================
 
 function init() {
-  loadData();
-  renderHome();
+  // Load geocode cache
+  try { S.geocodeCache = JSON.parse(localStorage.getItem('tpyyy_geo') || '{}'); } catch (_) {}
+
+  // Check for ?join=CODE in URL
+  const urlParams = new URLSearchParams(location.search);
+  const joinCode = urlParams.get('join');
+
+  // Initialize Firebase
+  if (typeof FIREBASE_CONFIG === 'undefined') {
+    renderSetup();
+    return;
+  }
+
+  try {
+    if (!firebase.apps.length) firebase.initializeApp(FIREBASE_CONFIG);
+    S.db = firebase.firestore();
+    // Enable offline persistence
+    S.db.enablePersistence({ synchronizeTabs: true })
+      .catch(e => console.warn('Offline persistence:', e.code));
+  } catch (e) {
+    console.error('Firebase init failed:', e);
+    renderSetup();
+    return;
+  }
+
+  if (joinCode) {
+    // Remove code from URL (clean)
+    history.replaceState({}, '', location.pathname);
+    renderHome();
+    // Auto-open join modal
+    requestAnimationFrame(() => {
+      showJoinModal();
+      requestAnimationFrame(() => {
+        const input = document.getElementById('j-code');
+        if (input) { input.value = joinCode.toUpperCase(); }
+      });
+    });
+  } else {
+    renderHome();
+  }
 }
 
 document.addEventListener('DOMContentLoaded', init);
