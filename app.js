@@ -10,10 +10,11 @@
 
 const S = {
   db: null,
-  trip: null,       // current trip doc data { id, name, inviteCode, places, ... }
-  members: [],      // live from Firestore
-  expenses: [],     // live from Firestore, ordered by createdAt asc
-  myMemberId: null, // for current trip
+  currentUser: null, // Firebase Auth user
+  trip: null,        // current trip doc data { id, name, inviteCode, places, ... }
+  members: [],       // live from Firestore
+  expenses: [],      // live from Firestore, ordered by createdAt asc
+  myMemberId: null,  // for current trip
   activeListeners: [],
   currentTab: 'expenses',
   geocodeCache: {},
@@ -34,20 +35,75 @@ function getRegistry() {
   catch { return []; }
 }
 
+function getMemberId(tripId) {
+  return getRegistry().find(r => r.tripId === tripId)?.memberId || null;
+}
+
+// Primary user identifier — Auth UID when signed in, device ID as fallback
+function getUserId() {
+  return S.currentUser?.uid || getDeviceId();
+}
+
+// Is this member "me"? Checks both userId (new) and deviceId (legacy)
+function isMe(m) {
+  if (!m) return false;
+  if (S.currentUser && m.userId === S.currentUser.uid) return true;
+  return m.deviceId === getDeviceId();
+}
+
+// Is the current user admin of the current trip?
+function isAdmin() {
+  if (!S.trip) return false;
+  if (S.currentUser && S.trip.adminUserId === S.currentUser.uid) return true;
+  return S.trip.adminDeviceId === getDeviceId();
+}
+
+// ---- Firestore-backed registry sync ----
+
+async function saveUserDoc(data) {
+  if (!S.currentUser || !S.db) return;
+  try {
+    await S.db.collection('users').doc(S.currentUser.uid).set(
+      { phone: S.currentUser.phoneNumber || '', ...data, updatedAt: TS() },
+      { merge: true }
+    );
+  } catch (e) { console.warn('saveUserDoc:', e); }
+}
+
+// Override saveToRegistry to also push to Firestore
 function saveToRegistry({ tripId, memberId, tripName, inviteCode }) {
   const reg = getRegistry();
   const i = reg.findIndex(r => r.tripId === tripId);
   const entry = { tripId, memberId, tripName, inviteCode };
   if (i >= 0) reg[i] = entry; else reg.unshift(entry);
   localStorage.setItem('tpyyy_registry', JSON.stringify(reg));
+  saveUserDoc({ registry: reg }); // async, fire-and-forget
 }
 
+// Override removeFromRegistry to also update Firestore
 function removeFromRegistry(tripId) {
-  localStorage.setItem('tpyyy_registry', JSON.stringify(getRegistry().filter(r => r.tripId !== tripId)));
+  const reg = getRegistry().filter(r => r.tripId !== tripId);
+  localStorage.setItem('tpyyy_registry', JSON.stringify(reg));
+  saveUserDoc({ registry: reg });
 }
 
-function getMemberId(tripId) {
-  return getRegistry().find(r => r.tripId === tripId)?.memberId || null;
+// On login: pull remote registry from Firestore and merge into local
+async function syncRegistryFromFirestore() {
+  if (!S.currentUser || !S.db) return;
+  try {
+    const doc = await S.db.collection('users').doc(S.currentUser.uid).get();
+    if (doc.exists) {
+      const remote = doc.data().registry || [];
+      const local = getRegistry();
+      // Merge: start with remote, add any local entries not already there
+      const merged = [...remote];
+      local.forEach(l => { if (!merged.find(r => r.tripId === l.tripId)) merged.push(l); });
+      localStorage.setItem('tpyyy_registry', JSON.stringify(merged));
+    } else if (getRegistry().length) {
+      // First login — upload whatever is already in localStorage
+      await saveUserDoc({ registry: getRegistry() });
+    }
+  } catch (e) { console.warn('syncRegistry:', e); }
 }
 
 // =============================================
@@ -74,6 +130,7 @@ async function generateInviteCode() {
 async function dbCreateTrip(tripName, places, creatorName, creatorUpiId) {
   const db = getDb();
   const deviceId = getDeviceId();
+  const userId = getUserId();
   const inviteCode = await generateInviteCode();
 
   const tripRef = db.collection('trips').doc();
@@ -86,8 +143,8 @@ async function dbCreateTrip(tripName, places, creatorName, creatorUpiId) {
   }));
 
   const batch = db.batch();
-  batch.set(tripRef, { name: tripName, inviteCode, places: mappedPlaces, createdAt: TS(), adminDeviceId: deviceId, currency: 'INR' });
-  batch.set(memberRef, { name: creatorName, upiId: creatorUpiId || '', color: pickColor(0), deviceId, isAdmin: true, joinedAt: TS() });
+  batch.set(tripRef, { name: tripName, inviteCode, places: mappedPlaces, createdAt: TS(), adminUserId: userId, adminDeviceId: deviceId, currency: 'INR' });
+  batch.set(memberRef, { name: creatorName, upiId: creatorUpiId || '', color: pickColor(0), userId, deviceId, isAdmin: true, joinedAt: TS() });
   batch.set(db.collection('inviteCodes').doc(inviteCode), { tripId, createdAt: TS() });
   await batch.commit();
 
@@ -97,23 +154,29 @@ async function dbCreateTrip(tripName, places, creatorName, creatorUpiId) {
 async function dbJoinTrip(code, name, upiId) {
   const db = getDb();
   const deviceId = getDeviceId();
+  const userId = getUserId();
   const normCode = code.trim().toUpperCase();
 
   const codeDoc = await db.collection('inviteCodes').doc(normCode).get();
   if (!codeDoc.exists) throw new Error('Invalid invite code. Check and try again.');
   const tripId = codeDoc.data().tripId;
 
-  // Already a member on this device?
-  const existing = await db.collection('trips').doc(tripId).collection('members')
-    .where('deviceId', '==', deviceId).get();
-  if (!existing.empty) {
+  // Already a member? Check by userId first (works across devices), then deviceId (legacy)
+  const membersRef = db.collection('trips').doc(tripId).collection('members');
+  let existing = S.currentUser
+    ? await membersRef.where('userId', '==', userId).get()
+    : null;
+  if (!existing || existing.empty) {
+    existing = await membersRef.where('deviceId', '==', deviceId).get();
+  }
+  if (existing && !existing.empty) {
     const tripDoc = await db.collection('trips').doc(tripId).get();
     return { tripId, memberId: existing.docs[0].id, tripName: tripDoc.data()?.name || '', inviteCode: normCode };
   }
 
-  const membersSnap = await db.collection('trips').doc(tripId).collection('members').get();
-  const memberRef = db.collection('trips').doc(tripId).collection('members').doc();
-  await memberRef.set({ name, upiId: upiId || '', color: pickColor(membersSnap.size), deviceId, isAdmin: false, joinedAt: TS() });
+  const membersSnap = await membersRef.get();
+  const memberRef = membersRef.doc();
+  await memberRef.set({ name, upiId: upiId || '', color: pickColor(membersSnap.size), userId, deviceId, isAdmin: false, joinedAt: TS() });
 
   const tripDoc = await db.collection('trips').doc(tripId).get();
   return { tripId, memberId: memberRef.id, tripName: tripDoc.data()?.name || '', inviteCode: normCode };
@@ -172,8 +235,8 @@ async function dbRemovePlace(tripId, placeId) {
 
 async function dbLeaveOrDeleteTrip(tripId) {
   const db = getDb();
-  const isAdmin = S.trip?.adminDeviceId === getDeviceId();
-  if (isAdmin) {
+  const admin = isAdmin();
+  if (admin) {
     // Delete entire trip (admin only)
     const batch = db.batch();
     const [members, expenses] = await Promise.all([
@@ -307,19 +370,43 @@ const CORS_PROXIES = [
   url => `https://corsproxy.io/?${encodeURIComponent(url)}`,
 ];
 
+// Patterns to find the real Google Maps URL inside proxy HTML responses.
+// maps.app.goo.gl pages embed the destination in several different ways.
+const MAPS_URL_PATS = [
+  // Standard canonical link
+  /rel="canonical"\s+href="([^"]+)"/,
+  // og:url meta tag (common in Google's mobile share pages)
+  /<meta[^>]+property="og:url"[^>]+content="([^"]+)"/,
+  /<meta[^>]+content="([^"]+)"[^>]+property="og:url"/,
+  // meta http-equiv refresh redirect
+  /<meta[^>]+http-equiv="refresh"[^>]+content="[^"]*url=(https?:\/\/[^"&]+)"/i,
+  // <link> tag pointing to a maps URL
+  /<link[^>]+href="(https:\/\/(?:www\.)?google\.com\/maps[^"]+)"/,
+  // JSON-embedded maps URLs (Google embeds state as JS strings)
+  /"(https:\\\/\\\/www\.google\.com\\\/maps\\\/dir\\\/[^"]{10,})"/,
+  /"(https:\/\/www\.google\.com\/maps\/dir\/[^"\\]{10,})"/,
+  // Any google.com/maps URL at least 40 chars (catches place + dir URLs)
+  /(https:\/\/(?:www\.)?google\.com\/maps\/(?:dir|place)\/[^\s"'<>]{15,})/,
+];
+
 async function expandShortenedUrl(url) {
   for (const proxy of CORS_PROXIES) {
     try {
-      const res = await fetch(proxy(url), { signal: AbortSignal.timeout(7000) });
+      const res = await fetch(proxy(url), { signal: AbortSignal.timeout(9000) });
       const text = await res.text();
-      // allorigins wraps in JSON, corsproxy returns raw HTML
-      const html = text.startsWith('{') ? (JSON.parse(text).contents || '') : text;
-      const pats = [
-        /rel="canonical"\s+href="([^"]+)"/,
-        /<link[^>]+href="(https:\/\/(?:www\.google\.com\/maps|maps\.google\.com)[^"]+)"/,
-        /"(https:\/\/www\.google\.com\/maps\/dir\/[^"]+)"/,
-      ];
-      for (const p of pats) { const m = html.match(p); if (m) return m[1]; }
+      // allorigins wraps in JSON {contents, status}, corsproxy returns raw HTML
+      let html = text;
+      if (text.trimStart().startsWith('{')) {
+        try { html = JSON.parse(text).contents || text; } catch (_) {}
+      }
+      for (const p of MAPS_URL_PATS) {
+        const m = html.match(p);
+        if (m) {
+          // Unescape JSON-encoded forward slashes if needed
+          const found = m[1].replace(/\\\//g, '/');
+          if (found.includes('google.com/maps')) return found;
+        }
+      }
     } catch (e) { console.warn('URL expand via proxy:', e.message); }
   }
   return null;
@@ -342,11 +429,11 @@ function extractPlacesFromUrl(url) {
   try {
     const u = new URL(url);
 
-    // /maps/dir/Place1/Place2/Place3/
+    // /maps/dir/Place1/Place2/Place3/data=!4m56!... (data= segment must be excluded)
     const dirM = u.pathname.match(/\/maps\/dir\/(.+)/);
     if (dirM) {
       dirM[1].split('/').forEach(seg => {
-        if (!seg || seg.startsWith('@')) return;
+        if (!seg || seg.startsWith('@') || seg.startsWith('data=') || seg.includes('!')) return;
         const dec = decodeURIComponent(seg.replace(/\+/g, ' ')).trim();
         if (dec.length > 1 && !/^[\d.,\s-]+$/.test(dec)) places.push(dec);
       });
@@ -570,6 +657,7 @@ function renderSetup() {
 
 function renderHome() {
   const reg = getRegistry();
+  const phone = S.currentUser?.phoneNumber || '';
   document.getElementById('app').innerHTML = `
     <div class="home-view">
       <header class="app-header">
@@ -577,6 +665,7 @@ function renderHome() {
         <div class="header-content">
           <div class="logo"><span class="logo-icon">✈️</span><h1>Tripppyyy</h1></div>
           <p class="tagline">Plan trips. Split expenses. Explore together.</p>
+          ${phone ? `<div class="auth-status-bar"><span class="auth-phone-pill">${phone}</span><button class="btn-ghost signout-btn" onclick="handleSignOut()">Sign out</button></div>` : ''}
         </div>
       </header>
       <main class="home-main">
@@ -795,8 +884,8 @@ function buildBubble(exp) {
   const isMe = exp.createdBy === S.myMemberId;
   const payer = S.members.find(m => m.id === exp.paidBy);
   const creator = S.members.find(m => m.id === exp.createdBy);
-  const isAdmin = S.trip?.adminDeviceId === getDeviceId();
-  const canDelete = isMe || isAdmin;
+  const amAdmin = isAdmin();
+  const canDelete = isMe || amAdmin;
 
   const payerLabel = exp.paidBy === S.myMemberId ? 'You paid' : `${escHtml(payer?.name || 'Someone')} paid`;
   const creatorLabel = isMe ? 'You' : escHtml(creator?.name || '?');
@@ -869,11 +958,11 @@ function renderMembersTab(el) {
       <div class="members-list">
         ${S.members.map(m => {
           const bal = calcBalances()[m.id] || 0;
-          const isMe = m.deviceId === getDeviceId();
+          const iAmMe = isMe(m);
           return `<div class="member-card">
             <div class="member-avatar large" style="background:${m.color}">${initials(m.name)}</div>
             <div class="member-info">
-              <h3 class="member-name">${escHtml(m.name)} ${isMe ? '<span class="you-badge">You</span>' : ''} ${m.isAdmin ? '<span class="admin-badge">Admin</span>' : ''}</h3>
+              <h3 class="member-name">${escHtml(m.name)} ${iAmMe ? '<span class="you-badge">You</span>' : ''} ${m.isAdmin ? '<span class="admin-badge">Admin</span>' : ''}</h3>
               <p class="member-upi">${m.upiId ? '📱 ' + escHtml(m.upiId) : '⚠️ No UPI ID'}</p>
               <div class="member-stats">
                 <span class="stat-item"><span class="stat-label">Paid</span><span class="stat-val">₹${fmt(getMemberPaid(m.id))}</span></span>
@@ -886,8 +975,8 @@ function renderMembersTab(el) {
               </div>
             </div>
             <div style="display:flex;flex-direction:column;gap:6px">
-              ${isMe ? `<button class="btn-secondary small" onclick="showEditMemberModal('${m.id}')">Edit</button>` : ''}
-              ${(S.trip?.adminDeviceId === getDeviceId() && !isMe) ? `<button class="btn-icon small danger" onclick="handleRemoveMember('${m.id}')">🗑️</button>` : ''}
+              ${iAmMe ? `<button class="btn-secondary small" onclick="showEditMemberModal('${m.id}')">Edit</button>` : ''}
+              ${(isAdmin() && !iAmMe) ? `<button class="btn-icon small danger" onclick="handleRemoveMember('${m.id}')">🗑️</button>` : ''}
             </div>
           </div>`;
         }).join('')}
@@ -934,11 +1023,11 @@ function renderSettleTab(el) {
           ${S.members.map(m => {
             const b = bal[m.id] || 0;
             const cls = b > 0.01 ? 'creditor' : b < -0.01 ? 'debtor' : 'settled';
-            const isMe = m.deviceId === getDeviceId();
+            const iAmMe = isMe(m);
             return `<div class="balance-card ${cls}">
               <div class="member-avatar" style="background:${m.color}">${initials(m.name)}</div>
               <div class="balance-info">
-                <span class="balance-name">${escHtml(m.name)}${isMe ? ' <span class="you-badge">You</span>' : ''}</span>
+                <span class="balance-name">${escHtml(m.name)}${iAmMe ? ' <span class="you-badge">You</span>' : ''}</span>
                 <span class="balance-amount ${b > 0.01 ? 'positive' : b < -0.01 ? 'negative' : ''}">
                   ${b > 0.01 ? `gets back ₹${fmt(b)}` : b < -0.01 ? `owes ₹${fmt(Math.abs(b))}` : 'all settled!'}
                 </span>
@@ -960,13 +1049,13 @@ function renderSettleTab(el) {
           ${debts.map(d => {
             const from = S.members.find(m => m.id === d.from);
             const to = S.members.find(m => m.id === d.to);
-            const isMyDebt = from?.deviceId === getDeviceId();
+            const isMyDebt = isMe(from);
             return `<div class="debt-card ${isMyDebt ? 'my-debt' : ''}">
               ${isMyDebt ? '<div class="debt-highlight-bar">You need to pay</div>' : ''}
               <div class="debt-flow">
                 <div class="debt-member">
                   <div class="member-avatar" style="background:${from?.color}">${initials(from?.name)}</div>
-                  <span>${from?.deviceId === getDeviceId() ? 'You' : escHtml(from?.name)}</span>
+                  <span>${isMyDebt ? 'You' : escHtml(from?.name)}</span>
                 </div>
                 <div class="debt-arrow">
                   <span class="debt-amount">₹${fmt(d.amount)}</span>
@@ -983,7 +1072,7 @@ function renderSettleTab(el) {
         </div>`}
       </div>
 
-      ${S.trip?.adminDeviceId === getDeviceId() ? `
+      ${isAdmin() ? `
         <div class="danger-zone">
           <h3>Danger Zone</h3>
           <button class="btn-danger" onclick="confirmDeleteTrip('${S.trip?.id}')">🗑️ Delete This Trip</button>
@@ -1060,11 +1149,11 @@ function showAddPlaceModal() {
 function showEditMemberModal(memberId) {
   const m = S.members.find(m => m.id === memberId);
   if (!m) return;
-  const isMe = m.deviceId === getDeviceId();
+  const iAmMe = isMe(m);
   modal('edit-member-modal', `✏️ Edit ${escHtml(m.name)}`,
     `<div class="form-group">
       <label>Name</label>
-      <input type="text" id="em-name" value="${escHtml(m.name)}" class="form-input" ${isMe ? '' : 'disabled'}>
+      <input type="text" id="em-name" value="${escHtml(m.name)}" class="form-input" ${iAmMe ? '' : 'disabled'}>
     </div>
     <div class="form-group">
       <label>UPI ID</label>
@@ -1072,7 +1161,7 @@ function showEditMemberModal(memberId) {
       <p class="input-hint">Used for Pay Now buttons in Settle Up</p>
     </div>`,
     `<button class="btn-ghost" onclick="closeModal('edit-member-modal')">Cancel</button>
-     <button class="btn-primary" onclick="doUpdateMember('${memberId}', ${isMe})">Save</button>`
+     <button class="btn-primary" onclick="doUpdateMember('${memberId}', ${iAmMe})">Save</button>`
   );
 }
 
@@ -1429,7 +1518,126 @@ async function confirmLeaveTrip(tripId) {
 }
 
 // =============================================
-// SECTION 21: APP INITIALIZATION
+// SECTION 21: PHONE AUTH
+// =============================================
+
+let recaptchaVerifier = null;
+let confirmationResult = null;
+
+function renderPhoneAuth() {
+  document.getElementById('app').innerHTML = `
+    <div class="auth-screen">
+      <div class="auth-card">
+        <div class="auth-logo">
+          <span class="auth-icon">✈️</span>
+          <h1>Tripppyyy</h1>
+          <p>Sign in with your mobile number to sync your trips across devices</p>
+        </div>
+
+        <div id="auth-step-phone">
+          <div class="form-group">
+            <label>Mobile Number</label>
+            <div class="phone-input-row">
+              <span class="country-code">+91</span>
+              <input type="tel" id="auth-phone" placeholder="9876543210"
+                class="form-input" maxlength="10" inputmode="numeric"
+                onkeydown="if(event.key==='Enter')handleSendOTP()">
+            </div>
+            <p class="input-hint">You'll receive a one-time verification code via SMS</p>
+          </div>
+          <div id="recaptcha-container"></div>
+          <button class="btn-primary auth-btn" id="send-otp-btn" onclick="handleSendOTP()">
+            Send OTP
+          </button>
+        </div>
+
+        <div id="auth-step-otp" class="hidden">
+          <p class="otp-sent-msg">OTP sent to <strong>+91 <span id="otp-phone-display"></span></strong></p>
+          <div class="form-group">
+            <label>Enter OTP</label>
+            <input type="text" id="auth-otp" placeholder="6-digit code"
+              class="form-input otp-input" maxlength="6" inputmode="numeric"
+              onkeydown="if(event.key==='Enter')handleVerifyOTP()">
+          </div>
+          <button class="btn-primary auth-btn" id="verify-otp-btn" onclick="handleVerifyOTP()">
+            Verify &amp; Continue
+          </button>
+          <button class="btn-ghost auth-btn" onclick="backToPhone()">← Change number</button>
+        </div>
+      </div>
+    </div>`;
+  requestAnimationFrame(() => document.getElementById('auth-phone')?.focus());
+}
+
+async function handleSendOTP() {
+  const phoneInput = document.getElementById('auth-phone')?.value.trim() || '';
+  if (!/^\d{10}$/.test(phoneInput)) {
+    toast('Enter a valid 10-digit mobile number', 'warning');
+    return;
+  }
+  const btn = document.getElementById('send-otp-btn');
+  btn.disabled = true;
+  btn.textContent = 'Sending…';
+  try {
+    if (!recaptchaVerifier) {
+      recaptchaVerifier = new firebase.auth.RecaptchaVerifier('recaptcha-container', {
+        size: 'invisible',
+        callback: () => {},
+      });
+    }
+    const phoneNumber = '+91' + phoneInput;
+    confirmationResult = await firebase.auth().signInWithPhoneNumber(phoneNumber, recaptchaVerifier);
+    document.getElementById('otp-phone-display').textContent = phoneInput;
+    document.getElementById('auth-step-phone').classList.add('hidden');
+    document.getElementById('auth-step-otp').classList.remove('hidden');
+    requestAnimationFrame(() => document.getElementById('auth-otp')?.focus());
+    toast('OTP sent!', 'success');
+  } catch (e) {
+    console.error('Send OTP error:', e);
+    toast(e.message || 'Failed to send OTP. Try again.', 'error');
+    btn.disabled = false;
+    btn.textContent = 'Send OTP';
+    if (recaptchaVerifier) { recaptchaVerifier.clear(); recaptchaVerifier = null; }
+  }
+}
+
+async function handleVerifyOTP() {
+  const code = document.getElementById('auth-otp')?.value.trim() || '';
+  if (!/^\d{6}$/.test(code)) {
+    toast('Enter the 6-digit OTP', 'warning');
+    return;
+  }
+  const btn = document.getElementById('verify-otp-btn');
+  btn.disabled = true;
+  btn.textContent = 'Verifying…';
+  try {
+    await confirmationResult.confirm(code);
+    // onAuthStateChanged fires and renders home
+  } catch (e) {
+    console.error('Verify OTP error:', e);
+    toast(e.message || 'Invalid OTP. Try again.', 'error');
+    btn.disabled = false;
+    btn.textContent = 'Verify & Continue';
+  }
+}
+
+function backToPhone() {
+  confirmationResult = null;
+  if (recaptchaVerifier) { recaptchaVerifier.clear(); recaptchaVerifier = null; }
+  document.getElementById('auth-step-otp').classList.add('hidden');
+  document.getElementById('auth-step-phone').classList.remove('hidden');
+  document.getElementById('auth-phone').value = '';
+}
+
+async function handleSignOut() {
+  if (!confirm('Sign out of Tripppyyy?')) return;
+  await firebase.auth().signOut();
+  localStorage.removeItem('tpyyy_registry');
+  toast('Signed out', 'info');
+}
+
+// =============================================
+// SECTION 22: APP INITIALIZATION
 // =============================================
 
 function init() {
@@ -1458,21 +1666,36 @@ function init() {
     return;
   }
 
-  if (joinCode) {
-    // Remove code from URL (clean)
-    history.replaceState({}, '', location.pathname);
-    renderHome();
-    // Auto-open join modal
-    requestAnimationFrame(() => {
-      showJoinModal();
-      requestAnimationFrame(() => {
-        const input = document.getElementById('j-code');
-        if (input) { input.value = joinCode.toUpperCase(); }
-      });
-    });
-  } else {
-    renderHome();
-  }
+  // Auth state — single source of truth for rendering
+  firebase.auth().onAuthStateChanged(async user => {
+    S.currentUser = user;
+    if (user) {
+      // Sync cloud registry → local before rendering home
+      await syncRegistryFromFirestore();
+      const pendingJoin = sessionStorage.getItem('pendingJoinCode') || joinCode;
+      if (pendingJoin) {
+        sessionStorage.removeItem('pendingJoinCode');
+        history.replaceState({}, '', location.pathname);
+        renderHome();
+        requestAnimationFrame(() => {
+          showJoinModal();
+          requestAnimationFrame(() => {
+            const input = document.getElementById('j-code');
+            if (input) input.value = pendingJoin.toUpperCase();
+          });
+        });
+      } else {
+        renderHome();
+      }
+    } else {
+      // Not signed in — stash any pending join code and show auth
+      if (joinCode) {
+        sessionStorage.setItem('pendingJoinCode', joinCode);
+        history.replaceState({}, '', location.pathname);
+      }
+      renderPhoneAuth();
+    }
+  });
 }
 
 document.addEventListener('DOMContentLoaded', init);
