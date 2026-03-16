@@ -366,11 +366,11 @@ function extractPlacesFromUrl(url) {
   try {
     const u = new URL(url);
 
-    // /maps/dir/Place1/Place2/Place3/
+    // /maps/dir/Place1/Place2/Place3/data=!4m56!... (data= segment must be excluded)
     const dirM = u.pathname.match(/\/maps\/dir\/(.+)/);
     if (dirM) {
       dirM[1].split('/').forEach(seg => {
-        if (!seg || seg.startsWith('@')) return;
+        if (!seg || seg.startsWith('@') || seg.startsWith('data=') || seg.includes('!')) return;
         const dec = decodeURIComponent(seg.replace(/\+/g, ' ')).trim();
         if (dec.length > 1 && !/^[\d.,\s-]+$/.test(dec)) places.push(dec);
       });
