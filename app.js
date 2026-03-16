@@ -302,21 +302,36 @@ async function geocodePlaces(names, onProgress) {
   return results;
 }
 
+const CORS_PROXIES = [
+  url => `https://api.allorigins.win/get?url=${encodeURIComponent(url)}`,
+  url => `https://corsproxy.io/?${encodeURIComponent(url)}`,
+];
+
+async function expandShortenedUrl(url) {
+  for (const proxy of CORS_PROXIES) {
+    try {
+      const res = await fetch(proxy(url), { signal: AbortSignal.timeout(7000) });
+      const text = await res.text();
+      // allorigins wraps in JSON, corsproxy returns raw HTML
+      const html = text.startsWith('{') ? (JSON.parse(text).contents || '') : text;
+      const pats = [
+        /rel="canonical"\s+href="([^"]+)"/,
+        /<link[^>]+href="(https:\/\/(?:www\.google\.com\/maps|maps\.google\.com)[^"]+)"/,
+        /"(https:\/\/www\.google\.com\/maps\/dir\/[^"]+)"/,
+      ];
+      for (const p of pats) { const m = html.match(p); if (m) return m[1]; }
+    } catch (e) { console.warn('URL expand via proxy:', e.message); }
+  }
+  return null;
+}
+
 async function parseGoogleMapsUrl(rawUrl) {
   const url = rawUrl.trim();
   let expandedUrl = url;
 
   if (/maps\.app\.goo\.gl|goo\.gl\/maps/.test(url)) {
-    try {
-      const res = await fetch(ALLORIGINS + encodeURIComponent(url), { signal: AbortSignal.timeout(12000) });
-      const data = await res.json();
-      const html = data.contents || '';
-      const pats = [
-        /rel="canonical"\s+href="([^"]+)"/,
-        /<link[^>]+href="(https:\/\/(?:www\.google\.com\/maps|maps\.google\.com)[^"]+)"/,
-      ];
-      for (const p of pats) { const m = html.match(p); if (m) { expandedUrl = m[1]; break; } }
-    } catch (e) { console.warn('URL expand:', e.message); }
+    const resolved = await expandShortenedUrl(url);
+    if (resolved) expandedUrl = resolved;
   }
 
   return extractPlacesFromUrl(expandedUrl);
@@ -326,18 +341,34 @@ function extractPlacesFromUrl(url) {
   const places = [];
   try {
     const u = new URL(url);
+
+    // /maps/dir/Place1/Place2/Place3/
     const dirM = u.pathname.match(/\/maps\/dir\/(.+)/);
     if (dirM) {
       dirM[1].split('/').forEach(seg => {
         if (!seg || seg.startsWith('@')) return;
         const dec = decodeURIComponent(seg.replace(/\+/g, ' ')).trim();
-        if (dec.length > 1 && !/^[\d.,]+$/.test(dec)) places.push(dec);
+        if (dec.length > 1 && !/^[\d.,\s-]+$/.test(dec)) places.push(dec);
       });
     }
+
+    // waypoints= query param (e.g. ?origin=A&waypoints=B|C&destination=D)
+    if (!places.length) {
+      const origin = u.searchParams.get('origin');
+      const dest = u.searchParams.get('destination');
+      const waypoints = u.searchParams.get('waypoints');
+      if (origin) places.push(decodeURIComponent(origin));
+      if (waypoints) waypoints.split('|').forEach(w => places.push(decodeURIComponent(w.trim())));
+      if (dest) places.push(decodeURIComponent(dest));
+    }
+
+    // /maps/place/PlaceName/
     if (!places.length) {
       const plM = u.pathname.match(/\/maps\/place\/([^/@]+)/);
       if (plM) places.push(decodeURIComponent(plM[1].replace(/\+/g, ' ')));
     }
+
+    // ?q= or ?query=
     if (!places.length) {
       const q = u.searchParams.get('q') || u.searchParams.get('query');
       if (q) places.push(decodeURIComponent(q));
