@@ -307,19 +307,43 @@ const CORS_PROXIES = [
   url => `https://corsproxy.io/?${encodeURIComponent(url)}`,
 ];
 
+// Patterns to find the real Google Maps URL inside proxy HTML responses.
+// maps.app.goo.gl pages embed the destination in several different ways.
+const MAPS_URL_PATS = [
+  // Standard canonical link
+  /rel="canonical"\s+href="([^"]+)"/,
+  // og:url meta tag (common in Google's mobile share pages)
+  /<meta[^>]+property="og:url"[^>]+content="([^"]+)"/,
+  /<meta[^>]+content="([^"]+)"[^>]+property="og:url"/,
+  // meta http-equiv refresh redirect
+  /<meta[^>]+http-equiv="refresh"[^>]+content="[^"]*url=(https?:\/\/[^"&]+)"/i,
+  // <link> tag pointing to a maps URL
+  /<link[^>]+href="(https:\/\/(?:www\.)?google\.com\/maps[^"]+)"/,
+  // JSON-embedded maps URLs (Google embeds state as JS strings)
+  /"(https:\\\/\\\/www\.google\.com\\\/maps\\\/dir\\\/[^"]{10,})"/,
+  /"(https:\/\/www\.google\.com\/maps\/dir\/[^"\\]{10,})"/,
+  // Any google.com/maps URL at least 40 chars (catches place + dir URLs)
+  /(https:\/\/(?:www\.)?google\.com\/maps\/(?:dir|place)\/[^\s"'<>]{15,})/,
+];
+
 async function expandShortenedUrl(url) {
   for (const proxy of CORS_PROXIES) {
     try {
-      const res = await fetch(proxy(url), { signal: AbortSignal.timeout(7000) });
+      const res = await fetch(proxy(url), { signal: AbortSignal.timeout(9000) });
       const text = await res.text();
-      // allorigins wraps in JSON, corsproxy returns raw HTML
-      const html = text.startsWith('{') ? (JSON.parse(text).contents || '') : text;
-      const pats = [
-        /rel="canonical"\s+href="([^"]+)"/,
-        /<link[^>]+href="(https:\/\/(?:www\.google\.com\/maps|maps\.google\.com)[^"]+)"/,
-        /"(https:\/\/www\.google\.com\/maps\/dir\/[^"]+)"/,
-      ];
-      for (const p of pats) { const m = html.match(p); if (m) return m[1]; }
+      // allorigins wraps in JSON {contents, status}, corsproxy returns raw HTML
+      let html = text;
+      if (text.trimStart().startsWith('{')) {
+        try { html = JSON.parse(text).contents || text; } catch (_) {}
+      }
+      for (const p of MAPS_URL_PATS) {
+        const m = html.match(p);
+        if (m) {
+          // Unescape JSON-encoded forward slashes if needed
+          const found = m[1].replace(/\\\//g, '/');
+          if (found.includes('google.com/maps')) return found;
+        }
+      }
     } catch (e) { console.warn('URL expand via proxy:', e.message); }
   }
   return null;
