@@ -536,6 +536,11 @@ function buildPayButtons(toMember, amount, tripName) {
 let mapInstance = null;
 
 function initMap(containerId) {
+  if (typeof L === 'undefined') {
+    const el = document.getElementById(containerId);
+    if (el) el.innerHTML = '<div style="display:flex;align-items:center;justify-content:center;height:100%;color:#94a3b8;font-size:14px;text-align:center;padding:24px">Map unavailable.<br>Check your internet connection and reload.</div>';
+    return null;
+  }
   if (mapInstance) { try { mapInstance.remove(); } catch (_) {} mapInstance = null; }
   mapInstance = L.map(containerId);
   L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
@@ -655,6 +660,30 @@ function renderSetup() {
 // SECTION 11: HOME VIEW
 // =============================================
 
+function buildAuthStatusBar() {
+  const user = S.currentUser;
+  if (!user) return '';
+  const providers = user.providerData.map(p => p.providerId);
+  const hasPhone = providers.includes('phone');
+  const hasGoogle = providers.includes('google.com');
+  const label = user.phoneNumber || user.displayName || user.email || 'Account';
+  const googleAvatar = user.photoURL
+    ? `<img src="${user.photoURL}" class="auth-avatar" alt="">`
+    : '';
+
+  const linkHints = [
+    !hasGoogle ? `<button class="link-btn" onclick="linkGoogleAccount()"><svg width="14" height="14" viewBox="0 0 48 48"><path fill="#EA4335" d="M24 9.5c3.54 0 6.71 1.22 9.21 3.6l6.85-6.85C35.9 2.38 30.47 0 24 0 14.62 0 6.51 5.38 2.56 13.22l7.98 6.19C12.43 13.72 17.74 9.5 24 9.5z"/><path fill="#4285F4" d="M46.98 24.55c0-1.57-.15-3.09-.38-4.55H24v9.02h12.94c-.58 2.96-2.26 5.48-4.78 7.18l7.73 6c4.51-4.18 7.09-10.36 7.09-17.65z"/><path fill="#FBBC05" d="M10.53 28.59c-.48-1.45-.76-2.99-.76-4.59s.27-3.14.76-4.59l-7.98-6.19C.92 16.46 0 20.12 0 24c0 3.88.92 7.54 2.56 10.78l7.97-6.19z"/><path fill="#34A853" d="M24 48c6.48 0 11.93-2.13 15.89-5.81l-7.73-6c-2.18 1.48-4.97 2.31-8.16 2.31-6.26 0-11.57-4.22-13.47-9.91l-7.98 6.19C6.51 42.62 14.62 48 24 48z"/></svg> Link Google</button>` : '',
+    !hasPhone ? `<button class="link-btn" onclick="linkPhoneAccount()">📱 Link Phone</button>` : '',
+  ].filter(Boolean).join('');
+
+  return `<div class="auth-status-bar">
+    ${googleAvatar}
+    <span class="auth-phone-pill">${escHtml(label)}</span>
+    ${linkHints}
+    <button class="signout-btn" onclick="handleSignOut()">Sign out</button>
+  </div>`;
+}
+
 function renderHome() {
   const reg = getRegistry();
   const phone = S.currentUser?.phoneNumber || '';
@@ -665,7 +694,7 @@ function renderHome() {
         <div class="header-content">
           <div class="logo"><span class="logo-icon">✈️</span><h1>Tripppyyy</h1></div>
           <p class="tagline">Plan trips. Split expenses. Explore together.</p>
-          ${phone ? `<div class="auth-status-bar"><span class="auth-phone-pill">${phone}</span><button class="btn-ghost signout-btn" onclick="handleSignOut()">Sign out</button></div>` : ''}
+          ${S.currentUser ? buildAuthStatusBar() : ''}
         </div>
       </header>
       <main class="home-main">
@@ -763,27 +792,53 @@ function renderTrip(tripId) {
   document.getElementById('app').innerHTML = `
     <div class="trip-view">
       <header class="trip-header">
-        <button class="btn-back" onclick="goHome()">← Back</button>
+        <button class="btn-back" onclick="goHome()">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M19 12H5M12 5l-7 7 7 7"/></svg>
+        </button>
         <div class="trip-title">
           <h1>${escHtml(getRegistry().find(r => r.tripId === tripId)?.tripName || 'Trip')}</h1>
-          <span class="trip-meta">Loading…</span>
+          <span class="trip-meta" id="trip-meta-text">Loading…</span>
         </div>
-        <button class="btn-icon" onclick="showTripInfo()" title="Trip info &amp; invite code">🔗</button>
+        <button class="btn-icon header-action" onclick="showTripInfo()" title="Invite code">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg>
+        </button>
       </header>
-      <div class="tabs">
-        <button class="tab" onclick="switchTab('map')" id="tab-map">🗺️ Map</button>
-        <button class="tab" onclick="switchTab('itinerary')" id="tab-itinerary">📍 Stops</button>
-        <button class="tab active" onclick="switchTab('expenses')" id="tab-expenses">💬 Expenses</button>
-        <button class="tab" onclick="switchTab('members')" id="tab-members">👥 Members</button>
-        <button class="tab" onclick="switchTab('settle')" id="tab-settle">🧾 Settle</button>
-      </div>
       <div id="tab-body" class="tab-body"></div>
+      <nav class="bottom-nav">
+        <button class="nav-tab" onclick="switchTab('map')" id="tab-map">
+          <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="3 6 9 3 15 6 21 3 21 18 15 21 9 18 3 21"/><line x1="9" y1="3" x2="9" y2="18"/><line x1="15" y1="6" x2="15" y2="21"/></svg>
+          <span class="nav-label">Map</span>
+        </button>
+        <button class="nav-tab" onclick="switchTab('itinerary')" id="tab-itinerary">
+          <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 10c0 7-9 13-9 13s-9-6-9-13a9 9 0 0 1 18 0z"/><circle cx="12" cy="10" r="3"/></svg>
+          <span class="nav-label">Stops</span>
+        </button>
+        <button class="nav-tab active" onclick="switchTab('expenses')" id="tab-expenses">
+          <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
+          <span class="nav-label">Expenses</span>
+        </button>
+        <button class="nav-tab" onclick="switchTab('members')" id="tab-members">
+          <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>
+          <span class="nav-label">People</span>
+        </button>
+        <button class="nav-tab" onclick="switchTab('settle')" id="tab-settle">
+          <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="1" x2="12" y2="23"/><path d="M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6"/></svg>
+          <span class="nav-label">Settle</span>
+        </button>
+      </nav>
     </div>
     <div id="modals"></div>
   `;
 
   S.currentTab = 'expenses';
   attachListeners(tripId);
+  rerenderTab();
+}
+
+function switchTab(name) {
+  S.currentTab = name;
+  document.querySelectorAll('.nav-tab').forEach(t => t.classList.remove('active'));
+  document.getElementById('tab-' + name)?.classList.add('active');
   rerenderTab();
 }
 
@@ -867,11 +922,9 @@ function renderExpensesTab(el) {
           </div>` :
           S.expenses.map(exp => buildBubble(exp)).join('')}
       </div>
-      <div class="chat-input-bar">
-        <button class="chat-add-btn" onclick="showAddExpenseModal()" ${S.members.length === 0 ? 'disabled title="Add members first"' : ''}>
-          ${S.members.length === 0 ? '⚠️ Add members first to log expenses' : '+ Add Expense'}
-        </button>
-      </div>
+      <button class="fab-add-expense" onclick="showAddExpenseModal()" ${S.members.length === 0 ? 'disabled title="Add members first"' : ''} title="Add expense">
+        <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+      </button>
     </div>`;
   // Scroll to bottom
   requestAnimationFrame(() => {
@@ -1531,10 +1584,17 @@ function renderPhoneAuth() {
         <div class="auth-logo">
           <span class="auth-icon">✈️</span>
           <h1>Tripppyyy</h1>
-          <p>Sign in with your mobile number to sync your trips across devices</p>
+          <p>Sign in to sync your trips across all your devices</p>
         </div>
 
         <div id="auth-step-phone">
+          <button class="btn-google" onclick="handleGoogleSignIn()">
+            <svg width="18" height="18" viewBox="0 0 48 48"><path fill="#EA4335" d="M24 9.5c3.54 0 6.71 1.22 9.21 3.6l6.85-6.85C35.9 2.38 30.47 0 24 0 14.62 0 6.51 5.38 2.56 13.22l7.98 6.19C12.43 13.72 17.74 9.5 24 9.5z"/><path fill="#4285F4" d="M46.98 24.55c0-1.57-.15-3.09-.38-4.55H24v9.02h12.94c-.58 2.96-2.26 5.48-4.78 7.18l7.73 6c4.51-4.18 7.09-10.36 7.09-17.65z"/><path fill="#FBBC05" d="M10.53 28.59c-.48-1.45-.76-2.99-.76-4.59s.27-3.14.76-4.59l-7.98-6.19C.92 16.46 0 20.12 0 24c0 3.88.92 7.54 2.56 10.78l7.97-6.19z"/><path fill="#34A853" d="M24 48c6.48 0 11.93-2.13 15.89-5.81l-7.73-6c-2.18 1.48-4.97 2.31-8.16 2.31-6.26 0-11.57-4.22-13.47-9.91l-7.98 6.19C6.51 42.62 14.62 48 24 48z"/></svg>
+            Continue with Google
+          </button>
+
+          <div class="auth-divider"><span>or</span></div>
+
           <div class="form-group">
             <label>Mobile Number</label>
             <div class="phone-input-row">
@@ -1543,11 +1603,11 @@ function renderPhoneAuth() {
                 class="form-input" maxlength="10" inputmode="numeric"
                 onkeydown="if(event.key==='Enter')handleSendOTP()">
             </div>
-            <p class="input-hint">You'll receive a one-time verification code via SMS</p>
+            <p class="input-hint">You'll receive a one-time SMS verification code</p>
           </div>
           <div id="recaptcha-container"></div>
           <button class="btn-primary auth-btn" id="send-otp-btn" onclick="handleSendOTP()">
-            Send OTP
+            Send OTP via SMS
           </button>
         </div>
 
@@ -1567,6 +1627,75 @@ function renderPhoneAuth() {
       </div>
     </div>`;
   requestAnimationFrame(() => document.getElementById('auth-phone')?.focus());
+}
+
+async function handleGoogleSignIn() {
+  const provider = new firebase.auth.GoogleAuthProvider();
+  try {
+    // On mobile use redirect (no popup blocked), on desktop use popup
+    if (/Mobi|Android|iPhone|iPad/i.test(navigator.userAgent)) {
+      await firebase.auth().signInWithRedirect(provider);
+    } else {
+      await firebase.auth().signInWithPopup(provider);
+    }
+    // onAuthStateChanged handles the rest
+  } catch (e) {
+    console.error('Google sign-in error:', e);
+    if (e.code !== 'auth/popup-closed-by-user') {
+      toast(e.message || 'Google sign-in failed', 'error');
+    }
+  }
+}
+
+async function linkGoogleAccount() {
+  if (!S.currentUser) return;
+  const provider = new firebase.auth.GoogleAuthProvider();
+  try {
+    if (/Mobi|Android|iPhone|iPad/i.test(navigator.userAgent)) {
+      await S.currentUser.linkWithRedirect(provider);
+    } else {
+      await S.currentUser.linkWithPopup(provider);
+      toast('Google account linked!', 'success');
+      renderHome();
+    }
+  } catch (e) {
+    if (e.code === 'auth/credential-already-in-use') {
+      toast('That Google account belongs to a different user', 'warning');
+    } else if (e.code !== 'auth/popup-closed-by-user') {
+      toast(e.message || 'Linking failed', 'error');
+    }
+  }
+}
+
+async function linkPhoneAccount() {
+  const phoneInput = prompt('Enter your mobile number (10 digits):');
+  if (!phoneInput || !/^\d{10}$/.test(phoneInput.trim())) {
+    toast('Enter a valid 10-digit number', 'warning');
+    return;
+  }
+  // We need a recaptcha container — create one temporarily
+  const container = document.createElement('div');
+  container.id = 'link-recaptcha';
+  document.body.appendChild(container);
+  try {
+    const rv = new firebase.auth.RecaptchaVerifier('link-recaptcha', { size: 'invisible', callback: () => {} });
+    const result = await firebase.auth().signInWithPhoneNumber('+91' + phoneInput.trim(), rv);
+    const code = prompt('Enter the OTP sent to +91' + phoneInput.trim() + ':');
+    if (!code) return;
+    const cred = firebase.auth.PhoneAuthProvider.credential(result.verificationId, code);
+    await S.currentUser.linkWithCredential(cred);
+    toast('Mobile number linked!', 'success');
+    renderHome();
+    rv.clear();
+  } catch (e) {
+    if (e.code === 'auth/credential-already-in-use') {
+      toast('That number is linked to a different account', 'warning');
+    } else {
+      toast(e.message || 'Linking failed', 'error');
+    }
+  } finally {
+    document.getElementById('link-recaptcha')?.remove();
+  }
 }
 
 async function handleSendOTP() {
@@ -1665,6 +1794,14 @@ function init() {
     renderSetup();
     return;
   }
+
+  // Handle Google redirect result (mobile sign-in redirect flow)
+  firebase.auth().getRedirectResult().catch(e => {
+    if (e.code && e.code !== 'auth/null-user') {
+      console.error('Redirect result error:', e);
+      toast(e.message || 'Sign-in failed', 'error');
+    }
+  });
 
   // Auth state — single source of truth for rendering
   firebase.auth().onAuthStateChanged(async user => {
